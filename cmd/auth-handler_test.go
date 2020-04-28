@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016, 2017 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016, 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	"github.com/minio/minio/pkg/auth"
+	iampolicy "github.com/minio/minio/pkg/iam/policy"
 )
 
 // Test get request auth type.
@@ -43,7 +45,7 @@ func TestGetRequestAuthType(t *testing.T) {
 				URL: &url.URL{
 					Host:   "127.0.0.1:9000",
 					Scheme: httpScheme,
-					Path:   "/",
+					Path:   SlashSeparator,
 				},
 				Header: http.Header{
 					"Authorization":        []string{"AWS4-HMAC-SHA256 <cred_string>"},
@@ -61,7 +63,7 @@ func TestGetRequestAuthType(t *testing.T) {
 				URL: &url.URL{
 					Host:   "127.0.0.1:9000",
 					Scheme: httpScheme,
-					Path:   "/",
+					Path:   SlashSeparator,
 				},
 				Header: http.Header{
 					"Authorization": []string{"Bearer 12313123"},
@@ -76,7 +78,7 @@ func TestGetRequestAuthType(t *testing.T) {
 				URL: &url.URL{
 					Host:   "127.0.0.1:9000",
 					Scheme: httpScheme,
-					Path:   "/",
+					Path:   SlashSeparator,
 				},
 				Header: http.Header{
 					"Authorization": []string{""},
@@ -91,7 +93,7 @@ func TestGetRequestAuthType(t *testing.T) {
 				URL: &url.URL{
 					Host:     "127.0.0.1:9000",
 					Scheme:   httpScheme,
-					Path:     "/",
+					Path:     SlashSeparator,
 					RawQuery: "X-Amz-Credential=EXAMPLEINVALIDEXAMPL%2Fs3%2F20160314%2Fus-east-1",
 				},
 			},
@@ -104,7 +106,7 @@ func TestGetRequestAuthType(t *testing.T) {
 				URL: &url.URL{
 					Host:   "127.0.0.1:9000",
 					Scheme: httpScheme,
-					Path:   "/",
+					Path:   SlashSeparator,
 				},
 				Header: http.Header{
 					"Content-Type": []string{"multipart/form-data"},
@@ -272,7 +274,7 @@ func mustNewRequest(method string, urlStr string, contentLength int64, body io.R
 // is signed with AWS Signature V4, fails if not able to do so.
 func mustNewSignedRequest(method string, urlStr string, contentLength int64, body io.ReadSeeker, t *testing.T) *http.Request {
 	req := mustNewRequest(method, urlStr, contentLength, body, t)
-	cred := globalServerConfig.GetCredential()
+	cred := globalActiveCred
 	if err := signRequestV4(req, cred.AccessKey, cred.SecretKey); err != nil {
 		t.Fatalf("Unable to inititalized new signed http request %s", err)
 	}
@@ -283,7 +285,7 @@ func mustNewSignedRequest(method string, urlStr string, contentLength int64, bod
 // is signed with AWS Signature V2, fails if not able to do so.
 func mustNewSignedV2Request(method string, urlStr string, contentLength int64, body io.ReadSeeker, t *testing.T) *http.Request {
 	req := mustNewRequest(method, urlStr, contentLength, body, t)
-	cred := globalServerConfig.GetCredential()
+	cred := globalActiveCred
 	if err := signRequestV2(req, cred.AccessKey, cred.SecretKey); err != nil {
 		t.Fatalf("Unable to inititalized new signed http request %s", err)
 	}
@@ -294,7 +296,7 @@ func mustNewSignedV2Request(method string, urlStr string, contentLength int64, b
 // is presigned with AWS Signature V2, fails if not able to do so.
 func mustNewPresignedV2Request(method string, urlStr string, contentLength int64, body io.ReadSeeker, t *testing.T) *http.Request {
 	req := mustNewRequest(method, urlStr, contentLength, body, t)
-	cred := globalServerConfig.GetCredential()
+	cred := globalActiveCred
 	if err := preSignV2(req, cred.AccessKey, cred.SecretKey, time.Now().Add(10*time.Minute).Unix()); err != nil {
 		t.Fatalf("Unable to inititalized new signed http request %s", err)
 	}
@@ -305,7 +307,7 @@ func mustNewPresignedV2Request(method string, urlStr string, contentLength int64
 // is presigned with AWS Signature V4, fails if not able to do so.
 func mustNewPresignedRequest(method string, urlStr string, contentLength int64, body io.ReadSeeker, t *testing.T) *http.Request {
 	req := mustNewRequest(method, urlStr, contentLength, body, t)
-	cred := globalServerConfig.GetCredential()
+	cred := globalActiveCred
 	if err := preSignV4(req, cred.AccessKey, cred.SecretKey, time.Now().Add(10*time.Minute).Unix()); err != nil {
 		t.Fatalf("Unable to inititalized new signed http request %s", err)
 	}
@@ -315,7 +317,7 @@ func mustNewPresignedRequest(method string, urlStr string, contentLength int64, 
 func mustNewSignedShortMD5Request(method string, urlStr string, contentLength int64, body io.ReadSeeker, t *testing.T) *http.Request {
 	req := mustNewRequest(method, urlStr, contentLength, body, t)
 	req.Header.Set("Content-Md5", "invalid-digest")
-	cred := globalServerConfig.GetCredential()
+	cred := globalActiveCred
 	if err := signRequestV4(req, cred.AccessKey, cred.SecretKey); err != nil {
 		t.Fatalf("Unable to initialized new signed http request %s", err)
 	}
@@ -325,17 +327,18 @@ func mustNewSignedShortMD5Request(method string, urlStr string, contentLength in
 func mustNewSignedEmptyMD5Request(method string, urlStr string, contentLength int64, body io.ReadSeeker, t *testing.T) *http.Request {
 	req := mustNewRequest(method, urlStr, contentLength, body, t)
 	req.Header.Set("Content-Md5", "")
-	cred := globalServerConfig.GetCredential()
+	cred := globalActiveCred
 	if err := signRequestV4(req, cred.AccessKey, cred.SecretKey); err != nil {
 		t.Fatalf("Unable to initialized new signed http request %s", err)
 	}
 	return req
 }
 
-func mustNewSignedBadMD5Request(method string, urlStr string, contentLength int64, body io.ReadSeeker, t *testing.T) *http.Request {
+func mustNewSignedBadMD5Request(method string, urlStr string, contentLength int64,
+	body io.ReadSeeker, t *testing.T) *http.Request {
 	req := mustNewRequest(method, urlStr, contentLength, body, t)
 	req.Header.Set("Content-Md5", "YWFhYWFhYWFhYWFhYWFhCg==")
-	cred := globalServerConfig.GetCredential()
+	cred := globalActiveCred
 	if err := signRequestV4(req, cred.AccessKey, cred.SecretKey); err != nil {
 		t.Fatalf("Unable to initialized new signed http request %s", err)
 	}
@@ -344,18 +347,21 @@ func mustNewSignedBadMD5Request(method string, urlStr string, contentLength int6
 
 // Tests is requested authenticated function, tests replies for s3 errors.
 func TestIsReqAuthenticated(t *testing.T) {
-	path, err := newTestConfig(globalMinioDefaultRegion)
+	objLayer, fsDir, err := prepareFS()
 	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(fsDir)
+	if err = newTestConfig(globalMinioDefaultRegion, objLayer); err != nil {
 		t.Fatalf("unable initialize config file, %s", err)
 	}
-	defer os.RemoveAll(path)
 
 	creds, err := auth.CreateCredentials("myuser", "mypassword")
 	if err != nil {
 		t.Fatalf("unable create credential, %s", err)
 	}
 
-	globalServerConfig.SetCredential(creds)
+	globalActiveCred = creds
 
 	// List of test cases for validating http request authentication.
 	testCases := []struct {
@@ -374,28 +380,35 @@ func TestIsReqAuthenticated(t *testing.T) {
 		{mustNewSignedRequest("GET", "http://127.0.0.1:9000", 0, nil, t), ErrNone},
 	}
 
+	ctx := context.Background()
 	// Validates all testcases.
 	for i, testCase := range testCases {
-		if s3Error := isReqAuthenticated(testCase.req, globalServerConfig.GetRegion()); s3Error != testCase.s3Error {
-			if _, err := ioutil.ReadAll(testCase.req.Body); toAPIErrorCode(err) != testCase.s3Error {
-				t.Fatalf("Test %d: Unexpected S3 error: want %d - got %d (got after reading request %d)", i, testCase.s3Error, s3Error, toAPIErrorCode(err))
+		s3Error := isReqAuthenticated(ctx, testCase.req, globalServerRegion, serviceS3)
+		if s3Error != testCase.s3Error {
+			if _, err := ioutil.ReadAll(testCase.req.Body); toAPIErrorCode(ctx, err) != testCase.s3Error {
+				t.Fatalf("Test %d: Unexpected S3 error: want %d - got %d (got after reading request %s)", i, testCase.s3Error, s3Error, toAPIError(ctx, err).Code)
 			}
 		}
 	}
 }
+
 func TestCheckAdminRequestAuthType(t *testing.T) {
-	path, err := newTestConfig(globalMinioDefaultRegion)
+	objLayer, fsDir, err := prepareFS()
 	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(fsDir)
+
+	if err = newTestConfig(globalMinioDefaultRegion, objLayer); err != nil {
 		t.Fatalf("unable initialize config file, %s", err)
 	}
-	defer os.RemoveAll(path)
 
 	creds, err := auth.CreateCredentials("myuser", "mypassword")
 	if err != nil {
 		t.Fatalf("unable create credential, %s", err)
 	}
 
-	globalServerConfig.SetCredential(creds)
+	globalActiveCred = creds
 	testCases := []struct {
 		Request *http.Request
 		ErrCode APIErrorCode
@@ -406,9 +419,55 @@ func TestCheckAdminRequestAuthType(t *testing.T) {
 		{Request: mustNewPresignedV2Request("GET", "http://127.0.0.1:9000", 0, nil, t), ErrCode: ErrAccessDenied},
 		{Request: mustNewPresignedRequest("GET", "http://127.0.0.1:9000", 0, nil, t), ErrCode: ErrAccessDenied},
 	}
+	ctx := context.Background()
 	for i, testCase := range testCases {
-		if s3Error := checkAdminRequestAuthType(testCase.Request, globalServerConfig.GetRegion()); s3Error != testCase.ErrCode {
+		if _, s3Error := checkAdminRequestAuthType(ctx, testCase.Request, iampolicy.AllAdminActions, globalServerRegion); s3Error != testCase.ErrCode {
 			t.Errorf("Test %d: Unexpected s3error returned wanted %d, got %d", i, testCase.ErrCode, s3Error)
+		}
+	}
+}
+
+func TestValidateAdminSignature(t *testing.T) {
+
+	ctx := context.Background()
+
+	objLayer, fsDir, err := prepareFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(fsDir)
+
+	if err = newTestConfig(globalMinioDefaultRegion, objLayer); err != nil {
+		t.Fatalf("unable initialize config file, %s", err)
+	}
+
+	creds, err := auth.CreateCredentials("admin", "mypassword")
+	if err != nil {
+		t.Fatalf("unable create credential, %s", err)
+	}
+	globalActiveCred = creds
+
+	testCases := []struct {
+		AccessKey string
+		SecretKey string
+		ErrCode   APIErrorCode
+	}{
+		{"", "", ErrInvalidAccessKeyID},
+		{"admin", "", ErrSignatureDoesNotMatch},
+		{"admin", "wrongpassword", ErrSignatureDoesNotMatch},
+		{"wronguser", "mypassword", ErrInvalidAccessKeyID},
+		{"", "mypassword", ErrInvalidAccessKeyID},
+		{"admin", "mypassword", ErrNone},
+	}
+
+	for i, testCase := range testCases {
+		req := mustNewRequest("GET", "http://localhost:9000/", 0, nil, t)
+		if err := signRequestV4(req, testCase.AccessKey, testCase.SecretKey); err != nil {
+			t.Fatalf("Unable to inititalized new signed http request %s", err)
+		}
+		_, _, _, s3Error := validateAdminSignature(ctx, req, globalMinioDefaultRegion)
+		if s3Error != testCase.ErrCode {
+			t.Errorf("Test %d: Unexpected s3error returned wanted %d, got %d", i+1, testCase.ErrCode, s3Error)
 		}
 	}
 }

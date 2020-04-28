@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2017 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,60 +17,14 @@
 package http
 
 import (
-	"context"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/minio/minio/cmd/logger"
 )
-
-var sslRequiredErrMsg = []byte("HTTP/1.0 403 Forbidden\r\n\r\nSSL required")
-
-// HTTP methods.
-var methods = []string{
-	http.MethodGet,
-	http.MethodHead,
-	http.MethodPost,
-	http.MethodPut,
-	http.MethodPatch,
-	http.MethodDelete,
-	http.MethodConnect,
-	http.MethodOptions,
-	http.MethodTrace,
-	"PRI", // HTTP 2 method
-}
-
-// maximum length of above methods + one space.
-var methodMaxLen = getMethodMaxLen() + 1
-
-func getMethodMaxLen() int {
-	maxLen := 0
-	for _, method := range methods {
-		if len(method) > maxLen {
-			maxLen = len(method)
-		}
-	}
-
-	return maxLen
-}
-
-func isHTTPMethod(s string) bool {
-	for _, method := range methods {
-		if s == method {
-			return true
-		}
-	}
-
-	return false
-}
 
 type acceptResult struct {
 	conn net.Conn
@@ -79,21 +33,19 @@ type acceptResult struct {
 
 // httpListener - HTTP listener capable of handling multiple server addresses.
 type httpListener struct {
-	mutex                  sync.Mutex         // to guard Close() method.
-	tcpListeners           []*net.TCPListener // underlaying TCP listeners.
-	acceptCh               chan acceptResult  // channel where all TCP listeners write accepted connection.
-	doneCh                 chan struct{}      // done channel for TCP listener goroutines.
-	tlsConfig              *tls.Config        // TLS configuration
-	tcpKeepAliveTimeout    time.Duration
-	readTimeout            time.Duration
-	writeTimeout           time.Duration
-	updateBytesReadFunc    func(int) // function to be called to update bytes read in BufConn.
-	updateBytesWrittenFunc func(int) // function to be called to update bytes written in BufConn.
+	mutex               sync.Mutex         // to guard Close() method.
+	tcpListeners        []*net.TCPListener // underlaying TCP listeners.
+	acceptCh            chan acceptResult  // channel where all TCP listeners write accepted connection.
+	doneCh              chan struct{}      // done channel for TCP listener goroutines.
+	tcpKeepAliveTimeout time.Duration
 }
 
 // isRoutineNetErr returns true if error is due to a network timeout,
 // connect reset or io.EOF and false otherwise
 func isRoutineNetErr(err error) bool {
+	if err == nil {
+		return false
+	}
 	if nErr, ok := err.(*net.OpError); ok {
 		// Check if the error is a tcp connection reset
 		if syscallErr, ok := nErr.Err.(*os.SyscallError); ok {
@@ -104,10 +56,11 @@ func isRoutineNetErr(err error) bool {
 		// Check if the error is a timeout
 		return nErr.Timeout()
 	}
-	return err == io.EOF
+	// check for io.EOF and also some times io.EOF is wrapped is another error type.
+	return err == io.EOF || err.Error() == "EOF"
 }
 
-// start - starts separate goroutine for each TCP listener.  A valid insecure/TLS HTTP new connection is passed to httpListener.acceptCh.
+// start - starts separate goroutine for each TCP listener.  A valid new connection is passed to httpListener.acceptCh.
 func (listener *httpListener) start() {
 	listener.acceptCh = make(chan acceptResult)
 	listener.doneCh = make(chan struct{})
@@ -134,84 +87,7 @@ func (listener *httpListener) start() {
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(listener.tcpKeepAliveTimeout)
 
-		bufconn := newBufConn(tcpConn, listener.readTimeout, listener.writeTimeout,
-			listener.updateBytesReadFunc, listener.updateBytesWrittenFunc)
-
-		// Peek bytes of maximum length of all HTTP methods.
-		data, err := bufconn.Peek(methodMaxLen)
-		if err != nil {
-			// Peek could fail legitimately when clients abruptly close
-			// connection. E.g. Chrome browser opens connections speculatively to
-			// speed up loading of a web page. Peek may also fail due to network
-			// saturation on a transport with read timeout set. All other kind of
-			// errors should be logged for further investigation. Thanks @brendanashworth.
-			if !isRoutineNetErr(err) {
-				reqInfo := (&logger.ReqInfo{}).AppendTags("remoteAddr", bufconn.RemoteAddr().String())
-				reqInfo.AppendTags("localAddr", bufconn.LocalAddr().String())
-				ctx := logger.SetReqInfo(context.Background(), reqInfo)
-				logger.LogIf(ctx, err)
-			}
-			bufconn.Close()
-			return
-		}
-
-		// Return bufconn if read data is a valid HTTP method.
-		tokens := strings.SplitN(string(data), " ", 2)
-		if isHTTPMethod(tokens[0]) {
-			if listener.tlsConfig == nil {
-				send(acceptResult{bufconn, nil}, doneCh)
-			} else {
-				// As TLS is configured and we got plain text HTTP request,
-				// return 403 (forbidden) error.
-				bufconn.Write(sslRequiredErrMsg)
-				bufconn.Close()
-			}
-			return
-		}
-
-		if listener.tlsConfig != nil {
-			// As the listener is configured with TLS, try to do TLS handshake, drop the connection if it fails.
-			tlsConn := tls.Server(bufconn, listener.tlsConfig)
-			if err = tlsConn.Handshake(); err != nil {
-				reqInfo := (&logger.ReqInfo{}).AppendTags("remoteAddr", bufconn.RemoteAddr().String())
-				reqInfo.AppendTags("localAddr", bufconn.LocalAddr().String())
-				ctx := logger.SetReqInfo(context.Background(), reqInfo)
-				logger.LogIf(ctx, err)
-				bufconn.Close()
-				return
-			}
-
-			// Check whether the connection contains HTTP request or not.
-			bufconn = newBufConn(tlsConn, listener.readTimeout, listener.writeTimeout,
-				listener.updateBytesReadFunc, listener.updateBytesWrittenFunc)
-
-			// Peek bytes of maximum length of all HTTP methods.
-			data, err = bufconn.Peek(methodMaxLen)
-			if err != nil {
-				if !isRoutineNetErr(err) {
-					reqInfo := (&logger.ReqInfo{}).AppendTags("remoteAddr", bufconn.RemoteAddr().String())
-					reqInfo.AppendTags("localAddr", bufconn.LocalAddr().String())
-					ctx := logger.SetReqInfo(context.Background(), reqInfo)
-					logger.LogIf(ctx, err)
-				}
-				bufconn.Close()
-				return
-			}
-
-			// Return bufconn if read data is a valid HTTP method.
-			tokens := strings.SplitN(string(data), " ", 2)
-			if isHTTPMethod(tokens[0]) {
-				send(acceptResult{bufconn, nil}, doneCh)
-				return
-			}
-		}
-		reqInfo := (&logger.ReqInfo{}).AppendTags("remoteAddr", bufconn.RemoteAddr().String())
-		reqInfo.AppendTags("localAddr", bufconn.LocalAddr().String())
-		ctx := logger.SetReqInfo(context.Background(), reqInfo)
-		logger.LogIf(ctx, err)
-
-		bufconn.Close()
-		return
+		send(acceptResult{tcpConn, nil}, doneCh)
 	}
 
 	// Closure to handle TCPListener until done channel is closed.
@@ -292,14 +168,10 @@ func (listener *httpListener) Addrs() (addrs []net.Addr) {
 // * listen to multiple addresses
 // * controls incoming connections only doing HTTP protocol
 func newHTTPListener(serverAddrs []string,
-	tlsConfig *tls.Config,
-	tcpKeepAliveTimeout time.Duration,
-	readTimeout time.Duration,
-	writeTimeout time.Duration,
-	updateBytesReadFunc func(int),
-	updateBytesWrittenFunc func(int)) (listener *httpListener, err error) {
+	tcpKeepAliveTimeout time.Duration) (listener *httpListener, err error) {
 
 	var tcpListeners []*net.TCPListener
+
 	// Close all opened listeners on error
 	defer func() {
 		if err == nil {
@@ -314,8 +186,10 @@ func newHTTPListener(serverAddrs []string,
 
 	for _, serverAddr := range serverAddrs {
 		var l net.Listener
-		if l, err = net.Listen("tcp", serverAddr); err != nil {
-			return nil, err
+		if l, err = listen("tcp", serverAddr); err != nil {
+			if l, err = fallbackListen("tcp", serverAddr); err != nil {
+				return nil, err
+			}
 		}
 
 		tcpListener, ok := l.(*net.TCPListener)
@@ -327,13 +201,8 @@ func newHTTPListener(serverAddrs []string,
 	}
 
 	listener = &httpListener{
-		tcpListeners:           tcpListeners,
-		tlsConfig:              tlsConfig,
-		tcpKeepAliveTimeout:    tcpKeepAliveTimeout,
-		readTimeout:            readTimeout,
-		writeTimeout:           writeTimeout,
-		updateBytesReadFunc:    updateBytesReadFunc,
-		updateBytesWrittenFunc: updateBytesWrittenFunc,
+		tcpListeners:        tcpListeners,
+		tcpKeepAliveTimeout: tcpKeepAliveTimeout,
 	}
 	listener.start()
 

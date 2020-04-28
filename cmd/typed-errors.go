@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2015, 2016 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -50,7 +50,7 @@ var errRPCAPIVersionUnsupported = errors.New("Unsupported rpc API version")
 // errServerTimeMismatch - server times are too far apart.
 var errServerTimeMismatch = errors.New("Server times are too far apart")
 
-// errInvalidBucketName - bucket name is reserved for Minio, usually
+// errInvalidBucketName - bucket name is reserved for MinIO, usually
 // returned for 'minio', '.minio.sys', buckets with capital letters.
 var errInvalidBucketName = errors.New("The specified bucket is not valid")
 
@@ -70,3 +70,28 @@ var errFirstDiskWait = errors.New("Waiting on other disks")
 
 // error returned when a bucket already exists
 var errBucketAlreadyExists = errors.New("Your previous request to create the named bucket succeeded and you already own it")
+
+// error returned for a negative actual size.
+var errInvalidDecompressedSize = errors.New("Invalid Decompressed Size")
+
+// error returned in IAM subsystem when user doesn't exist.
+var errNoSuchUser = errors.New("Specified user does not exist")
+
+// error returned in IAM subsystem when the service account doesn't exist.
+var errNoSuchServiceAccount = errors.New("Specified service account does not exist")
+
+// error returned in IAM subsystem when groups doesn't exist.
+var errNoSuchGroup = errors.New("Specified group does not exist")
+
+// error returned in IAM subsystem when a non-empty group needs to be
+// deleted.
+var errGroupNotEmpty = errors.New("Specified group is not empty - cannot remove it")
+
+// error returned in IAM subsystem when policy doesn't exist.
+var errNoSuchPolicy = errors.New("Specified canned policy does not exist")
+
+// error returned in IAM subsystem when an external users systems is configured.
+var errIAMActionNotAllowed = errors.New("Specified IAM action is not allowed under the current configuration")
+
+// error returned when access is denied.
+var errAccessDenied = errors.New("Do not have enough permissions to access this resource")

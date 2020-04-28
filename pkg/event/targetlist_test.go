@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,7 +34,12 @@ func (target ExampleTarget) ID() TargetID {
 	return target.id
 }
 
-func (target ExampleTarget) Send(eventData Event) error {
+// Save - Sends event directly without persisting.
+func (target ExampleTarget) Save(eventData Event) error {
+	return target.send(eventData)
+}
+
+func (target ExampleTarget) send(eventData Event) error {
 	b := make([]byte, 1)
 	if _, err := rand.Read(b); err != nil {
 		panic(err)
@@ -49,12 +54,26 @@ func (target ExampleTarget) Send(eventData Event) error {
 	return nil
 }
 
+// Send - interface compatible method does no-op.
+func (target ExampleTarget) Send(eventKey string) error {
+	return nil
+}
+
 func (target ExampleTarget) Close() error {
 	if target.closeErr {
 		return errors.New("close error")
 	}
 
 	return nil
+}
+
+func (target ExampleTarget) IsActive() (bool, error) {
+	return false, errors.New("not connected to target server/service")
+}
+
+// HasQueueStore - No-Op. Added for interface compatibility
+func (target ExampleTarget) HasQueueStore() bool {
+	return false
 }
 
 func TestTargetListAdd(t *testing.T) {
@@ -144,40 +163,6 @@ func TestTargetListExists(t *testing.T) {
 	}
 }
 
-func TestTargetListRemove(t *testing.T) {
-	targetListCase1 := NewTargetList()
-
-	targetListCase2 := NewTargetList()
-	if err := targetListCase2.Add(&ExampleTarget{TargetID{"2", "testcase"}, false, false}); err != nil {
-		panic(err)
-	}
-
-	targetListCase3 := NewTargetList()
-	if err := targetListCase3.Add(&ExampleTarget{TargetID{"3", "testcase"}, false, true}); err != nil {
-		panic(err)
-	}
-
-	testCases := []struct {
-		targetList *TargetList
-		targetID   TargetID
-		expectErr  bool
-	}{
-		{targetListCase1, TargetID{"1", "webhook"}, false},
-		{targetListCase2, TargetID{"1", "webhook"}, false},
-		{targetListCase3, TargetID{"3", "testcase"}, true},
-	}
-
-	for i, testCase := range testCases {
-		errCh := testCase.targetList.Remove(testCase.targetID)
-		err := <-errCh
-		expectErr := (err.Err != nil)
-
-		if expectErr != testCase.expectErr {
-			t.Fatalf("test %v: error: expected: %v, got: %v", i+1, testCase.expectErr, expectErr)
-		}
-	}
-}
-
 func TestTargetListList(t *testing.T) {
 	targetListCase1 := NewTargetList()
 
@@ -254,10 +239,13 @@ func TestTargetListSend(t *testing.T) {
 		{targetListCase4, TargetID{"4", "testcase"}, true},
 	}
 
+	resCh := make(chan TargetIDResult)
 	for i, testCase := range testCases {
-		errCh := testCase.targetList.Send(Event{}, testCase.targetID)
-		err := <-errCh
-		expectErr := (err.Err != nil)
+		testCase.targetList.Send(Event{}, map[TargetID]struct{}{
+			testCase.targetID: {},
+		}, resCh)
+		res := <-resCh
+		expectErr := (res.Err != nil)
 
 		if expectErr != testCase.expectErr {
 			t.Fatalf("test %v: error: expected: %v, got: %v", i+1, testCase.expectErr, expectErr)

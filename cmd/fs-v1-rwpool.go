@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@
 package cmd
 
 import (
-	"context"
 	"os"
 	pathutil "path"
 	"sync"
@@ -51,7 +50,7 @@ func (fsi *fsIOPool) lookupToRead(path string) (*lock.RLockedFile, bool) {
 		if rlkFile.IsClosed() {
 			// Log this as an error.
 			reqInfo := (&logger.ReqInfo{}).AppendTags("path", path)
-			ctx := logger.SetReqInfo(context.Background(), reqInfo)
+			ctx := logger.SetReqInfo(GlobalContext, reqInfo)
 			logger.LogIf(ctx, errUnexpected)
 
 			// Purge the cached lock path from map.
@@ -93,18 +92,20 @@ func (fsi *fsIOPool) Open(path string) (*lock.RLockedFile, error) {
 		// Open file for reading with read lock.
 		newRlkFile, err := lock.RLockedOpenFile(path)
 		if err != nil {
-			if os.IsNotExist(err) {
+			switch {
+			case os.IsNotExist(err):
 				return nil, errFileNotFound
-			} else if os.IsPermission(err) {
+			case os.IsPermission(err):
 				return nil, errFileAccessDenied
-			} else if isSysErrIsDir(err) {
+			case isSysErrIsDir(err):
 				return nil, errIsNotRegular
-			} else if isSysErrNotDir(err) {
+			case isSysErrNotDir(err):
 				return nil, errFileAccessDenied
-			} else if isSysErrPathNotFound(err) {
+			case isSysErrPathNotFound(err):
 				return nil, errFileNotFound
+			default:
+				return nil, err
 			}
-			return nil, err
 		}
 
 		/// Save new reader on the map.
@@ -148,14 +149,16 @@ func (fsi *fsIOPool) Write(path string) (wlk *lock.LockedFile, err error) {
 
 	wlk, err = lock.LockedOpenFile(path, os.O_RDWR, 0666)
 	if err != nil {
-		if os.IsNotExist(err) {
+		switch {
+		case os.IsNotExist(err):
 			return nil, errFileNotFound
-		} else if os.IsPermission(err) {
+		case os.IsPermission(err):
 			return nil, errFileAccessDenied
-		} else if isSysErrIsDir(err) {
+		case isSysErrIsDir(err):
 			return nil, errIsNotRegular
+		default:
+			return nil, err
 		}
-		return nil, err
 	}
 	return wlk, nil
 }
@@ -175,14 +178,16 @@ func (fsi *fsIOPool) Create(path string) (wlk *lock.LockedFile, err error) {
 	// Attempt to create the file.
 	wlk, err = lock.LockedOpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
-		if os.IsPermission(err) {
+		switch {
+		case os.IsPermission(err):
 			return nil, errFileAccessDenied
-		} else if isSysErrIsDir(err) {
+		case isSysErrIsDir(err):
 			return nil, errIsNotRegular
-		} else if isSysErrPathNotFound(err) {
+		case isSysErrPathNotFound(err):
 			return nil, errFileAccessDenied
+		default:
+			return nil, err
 		}
-		return nil, err
 	}
 
 	// Success.

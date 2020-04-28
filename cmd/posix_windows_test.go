@@ -1,7 +1,7 @@
 // +build windows
 
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -69,7 +69,7 @@ func TestUNCPaths(t *testing.T) {
 	}
 }
 
-// Test to validate posix behaviour on windows when a non-final path component is a file.
+// Test to validate posix behavior on windows when a non-final path component is a file.
 func TestUNCPathENOTDIR(t *testing.T) {
 	var err error
 	// Instantiate posix object to manage a disk

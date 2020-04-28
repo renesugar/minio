@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016, 2017 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016, 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,17 +40,20 @@ func TestResourceListSorting(t *testing.T) {
 
 // Tests presigned v2 signature.
 func TestDoesPresignedV2SignatureMatch(t *testing.T) {
-	root, err := newTestConfig(globalMinioDefaultRegion)
+	obj, fsDir, err := prepareFS()
 	if err != nil {
-		t.Fatal("Unable to initialize test config.")
+		t.Fatal(err)
 	}
-	defer os.RemoveAll(root)
+	defer os.RemoveAll(fsDir)
+	if err = newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		t.Fatal(err)
+	}
 
 	now := UTCNow()
 
 	var (
-		accessKey = globalServerConfig.GetCredential().AccessKey
-		secretKey = globalServerConfig.GetCredential().SecretKey
+		accessKey = globalActiveCred.AccessKey
+		secretKey = globalActiveCred.SecretKey
 	)
 	testCases := []struct {
 		queryParams map[string]string
@@ -157,13 +160,16 @@ func TestDoesPresignedV2SignatureMatch(t *testing.T) {
 
 // TestValidateV2AuthHeader - Tests validate the logic of V2 Authorization header validator.
 func TestValidateV2AuthHeader(t *testing.T) {
-	root, err := newTestConfig(globalMinioDefaultRegion)
+	obj, fsDir, err := prepareFS()
 	if err != nil {
-		t.Fatal("Unable to initialize test config.")
+		t.Fatal(err)
 	}
-	defer os.RemoveAll(root)
+	defer os.RemoveAll(fsDir)
+	if err = newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		t.Fatal(err)
+	}
 
-	accessID := globalServerConfig.GetCredential().AccessKey
+	accessID := globalActiveCred.AccessKey
 	testCases := []struct {
 		authString    string
 		expectedError APIErrorCode
@@ -217,7 +223,12 @@ func TestValidateV2AuthHeader(t *testing.T) {
 	for i, testCase := range testCases {
 		t.Run(fmt.Sprintf("Case %d AuthStr \"%s\".", i+1, testCase.authString), func(t *testing.T) {
 
-			actualErrCode := validateV2AuthHeader(testCase.authString)
+			req := &http.Request{
+				Header: make(http.Header),
+				URL:    &url.URL{},
+			}
+			req.Header.Set("Authorization", testCase.authString)
+			_, actualErrCode := validateV2AuthHeader(req)
 
 			if testCase.expectedError != actualErrCode {
 				t.Errorf("Expected the error code to be %v, got %v.", testCase.expectedError, actualErrCode)
@@ -228,12 +239,16 @@ func TestValidateV2AuthHeader(t *testing.T) {
 }
 
 func TestDoesPolicySignatureV2Match(t *testing.T) {
-	root, err := newTestConfig(globalMinioDefaultRegion)
+	obj, fsDir, err := prepareFS()
 	if err != nil {
-		t.Fatal("Unable to initialize test config.")
+		t.Fatal(err)
 	}
-	defer os.RemoveAll(root)
-	creds := globalServerConfig.GetCredential()
+	defer os.RemoveAll(fsDir)
+	if err = newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		t.Fatal(err)
+	}
+
+	creds := globalActiveCred
 	policy := "policy"
 	testCases := []struct {
 		accessKey string

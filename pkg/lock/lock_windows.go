@@ -1,7 +1,7 @@
 // +build windows
 
 /*
- * Minio Cloud Storage, (C) 2016, 2017 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016, 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -76,13 +76,26 @@ func lockedOpenFile(path string, flag int, perm os.FileMode, lockType uint32) (*
 // doesn't wait forever but instead returns if it cannot
 // acquire a write lock.
 func TryLockedOpenFile(path string, flag int, perm os.FileMode) (*LockedFile, error) {
-	return lockedOpenFile(path, flag, perm, lockFileFailImmediately)
+	var lockType uint32 = lockFileFailImmediately | lockFileExclusiveLock
+	switch flag {
+	case syscall.O_RDONLY:
+		// https://docs.microsoft.com/en-us/windows/desktop/api/fileapi/nf-fileapi-lockfileex
+		//lint:ignore SA4016 Reasons
+		lockType = lockFileFailImmediately | 0 // Set this to enable shared lock and fail immediately.
+	}
+	return lockedOpenFile(path, flag, perm, lockType)
 }
 
 // LockedOpenFile - initializes a new lock and protects
 // the file from concurrent access.
 func LockedOpenFile(path string, flag int, perm os.FileMode) (*LockedFile, error) {
-	return lockedOpenFile(path, flag, perm, 0)
+	var lockType uint32 = lockFileExclusiveLock
+	switch flag {
+	case syscall.O_RDONLY:
+		// https://docs.microsoft.com/en-us/windows/desktop/api/fileapi/nf-fileapi-lockfileex
+		lockType = 0 // Set this to enable shared lock.
+	}
+	return lockedOpenFile(path, flag, perm, lockType)
 }
 
 // fixLongPath returns the extended-length (\\?\-prefixed) form of
@@ -165,7 +178,7 @@ func fixLongPath(path string) string {
 	return string(pathbuf[:w])
 }
 
-// perm param is ignored, on windows file perms/NT acls
+// Open - perm param is ignored, on windows file perms/NT acls
 // are not octet combinations. Providing access to NT
 // acls is out of scope here.
 func Open(path string, flag int, perm os.FileMode) (*os.File, error) {
@@ -217,14 +230,11 @@ func Open(path string, flag int, perm os.FileMode) (*os.File, error) {
 
 func lockFile(fd syscall.Handle, flags uint32) error {
 	// https://msdn.microsoft.com/en-us/library/windows/desktop/aa365203(v=vs.85).aspx
-	var flag uint32 = lockFileExclusiveLock // Lockfile exlusive.
-	flag |= flags
-
 	if fd == syscall.InvalidHandle {
 		return nil
 	}
 
-	err := lockFileEx(fd, flag, 1, 0, &syscall.Overlapped{})
+	err := lockFileEx(fd, flags, 1, 0, &syscall.Overlapped{})
 	if err == nil {
 		return nil
 	} else if err.Error() == "The process cannot access the file because another process has locked a portion of the file." {

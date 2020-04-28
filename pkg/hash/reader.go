@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2017 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,8 +33,9 @@ var errNestedReader = errors.New("Nesting of Reader detected, not allowed")
 // Reader writes what it reads from an io.Reader to an MD5 and SHA256 hash.Hash.
 // Reader verifies that the content of the io.Reader matches the expected checksums.
 type Reader struct {
-	src  io.Reader
-	size int64
+	src        io.Reader
+	size       int64
+	actualSize int64
 
 	md5sum, sha256sum   []byte // Byte values of md5sum, sha256sum of client sent values.
 	md5Hash, sha256Hash hash.Hash
@@ -42,7 +43,7 @@ type Reader struct {
 
 // NewReader returns a new hash Reader which computes the MD5 sum and
 // SHA256 sum (if set) of the provided io.Reader at EOF.
-func NewReader(src io.Reader, size int64, md5Hex, sha256Hex string) (*Reader, error) {
+func NewReader(src io.Reader, size int64, md5Hex, sha256Hex string, actualSize int64, strictCompat bool) (*Reader, error) {
 	if _, ok := src.(*Reader); ok {
 		return nil, errNestedReader
 	}
@@ -61,6 +62,14 @@ func NewReader(src io.Reader, size int64, md5Hex, sha256Hex string) (*Reader, er
 	if len(sha256sum) != 0 {
 		sha256Hash = sha256.New()
 	}
+	var md5Hash hash.Hash
+	if strictCompat {
+		// Strict compatibility is set then we should
+		// calculate md5sum always.
+		md5Hash = md5.New()
+	} else if len(md5sum) != 0 {
+		md5Hash = md5.New()
+	}
 	if size >= 0 {
 		src = io.LimitReader(src, size)
 	}
@@ -69,15 +78,18 @@ func NewReader(src io.Reader, size int64, md5Hex, sha256Hex string) (*Reader, er
 		sha256sum:  sha256sum,
 		src:        src,
 		size:       size,
-		md5Hash:    md5.New(),
+		md5Hash:    md5Hash,
 		sha256Hash: sha256Hash,
+		actualSize: actualSize,
 	}, nil
 }
 
 func (r *Reader) Read(p []byte) (n int, err error) {
 	n, err = r.src.Read(p)
 	if n > 0 {
-		r.md5Hash.Write(p[:n])
+		if r.md5Hash != nil {
+			r.md5Hash.Write(p[:n])
+		}
 		if r.sha256Hash != nil {
 			r.sha256Hash.Write(p[:n])
 		}
@@ -98,6 +110,10 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 // data.
 func (r *Reader) Size() int64 { return r.size }
 
+// ActualSize returns the pre-modified size of the object.
+// DecompressedSize - For compressed objects.
+func (r *Reader) ActualSize() int64 { return r.actualSize }
+
 // MD5 - returns byte md5 value
 func (r *Reader) MD5() []byte {
 	return r.md5sum
@@ -108,7 +124,10 @@ func (r *Reader) MD5() []byte {
 // NOTE: Calling this function multiple times might yield
 // different results if they are intermixed with Reader.
 func (r *Reader) MD5Current() []byte {
-	return r.md5Hash.Sum(nil)
+	if r.md5Hash != nil {
+		return r.md5Hash.Sum(nil)
+	}
+	return nil
 }
 
 // SHA256 - returns byte sha256 value
@@ -139,7 +158,7 @@ func (r *Reader) Verify() error {
 			return SHA256Mismatch{hex.EncodeToString(r.sha256sum), hex.EncodeToString(sum)}
 		}
 	}
-	if len(r.md5sum) > 0 {
+	if r.md5Hash != nil && len(r.md5sum) > 0 {
 		if sum := r.md5Hash.Sum(nil); !bytes.Equal(r.md5sum, sum) {
 			return BadDigest{hex.EncodeToString(r.md5sum), hex.EncodeToString(sum)}
 		}

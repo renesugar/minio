@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016, 2017 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016, 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,13 +31,13 @@ func niceError(code APIErrorCode) string {
 		return "ErrNone"
 	}
 
-	return fmt.Sprintf("%s (%s)", errorCodeResponse[code].Code, errorCodeResponse[code].Description)
+	return fmt.Sprintf("%s (%s)", errorCodes[code].Code, errorCodes[code].Description)
 }
 
 func TestDoesPolicySignatureMatch(t *testing.T) {
 	credentialTemplate := "%s/%s/%s/s3/aws4_request"
 	now := UTCNow()
-	accessKey := globalServerConfig.GetCredential().AccessKey
+	accessKey := globalActiveCred.AccessKey
 
 	testCases := []struct {
 		form     http.Header
@@ -73,8 +73,8 @@ func TestDoesPolicySignatureMatch(t *testing.T) {
 				},
 				"X-Amz-Date": []string{now.Format(iso8601Format)},
 				"X-Amz-Signature": []string{
-					getSignature(getSigningKey(globalServerConfig.GetCredential().SecretKey, now,
-						globalMinioDefaultRegion), "policy"),
+					getSignature(getSigningKey(globalActiveCred.SecretKey, now,
+						globalMinioDefaultRegion, serviceS3), "policy"),
 				},
 				"Policy": []string{"policy"},
 			},
@@ -92,19 +92,22 @@ func TestDoesPolicySignatureMatch(t *testing.T) {
 }
 
 func TestDoesPresignedSignatureMatch(t *testing.T) {
-	rootPath, err := newTestConfig(globalMinioDefaultRegion)
+	obj, fsDir, err := prepareFS()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(rootPath)
+	defer os.RemoveAll(fsDir)
+	if err = newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		t.Fatal(err)
+	}
 
 	// sha256 hash of "payload"
 	payloadSHA256 := "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
 	now := UTCNow()
 	credentialTemplate := "%s/%s/%s/s3/aws4_request"
 
-	region := globalServerConfig.GetRegion()
-	accessKeyID := globalServerConfig.GetCredential().AccessKey
+	region := globalServerRegion
+	accessKeyID := globalActiveCred.AccessKey
 	testCases := []struct {
 		queryParams map[string]string
 		headers     map[string]string
@@ -290,7 +293,7 @@ func TestDoesPresignedSignatureMatch(t *testing.T) {
 		}
 
 		// Check if it matches!
-		err := doesPresignedSignatureMatch(payloadSHA256, req, testCase.region)
+		err := doesPresignedSignatureMatch(payloadSHA256, req, testCase.region, serviceS3)
 		if err != testCase.expected {
 			t.Errorf("(%d) expected to get %s, instead got %s", i, niceError(testCase.expected), niceError(err))
 		}

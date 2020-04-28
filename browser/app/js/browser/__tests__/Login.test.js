@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,21 +19,24 @@ import { shallow, mount } from "enzyme"
 import { Login } from "../Login"
 import web from "../../web"
 
-jest.mock('../../web', () => ({
+jest.mock("../../web", () => ({
   Login: jest.fn(() => {
     return Promise.resolve({ token: "test", uiVersion: "2018-02-01T01:17:47Z" })
   }),
-  LoggedIn: jest.fn()
+  LoggedIn: jest.fn(),
+  GetDiscoveryDoc: jest.fn(() => {
+    return Promise.resolve({ DiscoveryDoc: {"authorization_endpoint": "test"} })
+  })
 }))
 
 describe("Login", () => {
   const dispatchMock = jest.fn()
   const showAlertMock = jest.fn()
   const clearAlertMock = jest.fn()
-  
+
   it("should render without crashing", () => {
-    shallow(<Login 
-      dispatch={dispatchMock} 
+    shallow(<Login
+      dispatch={dispatchMock}
       alert={{ show: false, type: "danger"}}
       showAlert={showAlertMock}
       clearAlert={clearAlertMock}
@@ -42,8 +45,8 @@ describe("Login", () => {
 
   it("should initially have the is-guest class", () => {
     const wrapper = shallow(
-      <Login 
-        dispatch={dispatchMock} 
+      <Login
+        dispatch={dispatchMock}
         alert={{ show: false, type: "danger"}}
         showAlert={showAlertMock}
         clearAlert={clearAlertMock}
@@ -55,44 +58,50 @@ describe("Login", () => {
 
   it("should throw an alert if the keys are empty in login form", () => {
     const wrapper = mount(
-      <Login 
-        dispatch={dispatchMock} 
+      <Login
+        dispatch={dispatchMock}
         alert={{ show: false, type: "danger"}}
         showAlert={showAlertMock}
         clearAlert={clearAlertMock}
-      />,
-      { attachTo: document.body }
+      />
     )
     // case where both keys are empty - displays the second warning
     wrapper.find("form").simulate("submit")
     expect(showAlertMock).toHaveBeenCalledWith("danger", "Secret Key cannot be empty")
 
     // case where access key is empty
-    document.getElementById("secretKey").value = "secretKey"
+    wrapper.setState({
+      accessKey: "",
+      secretKey: "secretKey"
+    })
     wrapper.find("form").simulate("submit")
     expect(showAlertMock).toHaveBeenCalledWith("danger", "Access Key cannot be empty")
 
     // case where secret key is empty
-    document.getElementById("accessKey").value = "accessKey"
+    wrapper.setState({
+      accessKey: "accessKey",
+      secretKey: ""
+    })
     wrapper.find("form").simulate("submit")
     expect(showAlertMock).toHaveBeenCalledWith("danger", "Secret Key cannot be empty")
   })
 
   it("should call web.Login with correct arguments if both keys are entered", () => {
     const wrapper = mount(
-      <Login 
-        dispatch={dispatchMock} 
+      <Login
+        dispatch={dispatchMock}
         alert={{ show: false, type: "danger"}}
         showAlert={showAlertMock}
         clearAlert={clearAlertMock}
-      />,
-      { attachTo: document.body }
+      />
     )
-    document.getElementById("accessKey").value = "accessKey"
-    document.getElementById("secretKey").value = "secretKey"
+    wrapper.setState({
+      accessKey: "accessKey",
+      secretKey: "secretKey"
+    })
     wrapper.find("form").simulate("submit")
     expect(web.Login).toHaveBeenCalledWith({
-      "username": "accessKey", 
+      "username": "accessKey",
       "password": "secretKey"
     })
   })

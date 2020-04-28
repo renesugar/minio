@@ -1,34 +1,58 @@
 go_import_path: github.com/minio/minio
-sudo: required
-
-services:
- - docker
-
-dist: trusty
 
 language: go
 
-os:
-- linux
+addons:
+  apt:
+    packages:
+    - shellcheck
 
-env:
-- ARCH=x86_64
+services:
+  - docker
+
+# this ensures PRs based on a local branch are not built twice
+# the downside is that a PR targeting a different branch is not built
+# but as a workaround you can add the branch to this list
+branches:
+  only:
+    - master
+
+matrix:
+  include:
+    - os: linux
+      dist: trusty
+      sudo: required
+      env:
+        - ARCH=x86_64
+        - CGO_ENABLED=0
+        - GO111MODULE=on
+        - SIMPLE_CI=1
+      go: 1.13.x
+      script:
+        - make
+        - diff -au <(gofmt -s -d cmd) <(printf "")
+        - diff -au <(gofmt -s -d pkg) <(printf "")
+        - make test-race
+        - make crosscompile
+        - make verify
+        - cd browser && npm install && npm run test && cd ..
+        - bash -c 'shopt -s globstar; shellcheck mint/**/*.sh'
+
+    - os: windows
+      env:
+        - ARCH=x86_64
+        - CGO_ENABLED=0
+        - GO111MODULE=on
+        - SIMPLE_CI=1
+      go: 1.13.x
+      script:
+        - go build --ldflags="$(go run buildscripts/gen-ldflags.go)" -o %GOPATH%\bin\minio.exe
+        - for d in $(go list ./... | grep -v browser); do go test -v --timeout 20m "$d"; done
+
+before_script:
+  # Add an IPv6 config - see the corresponding Travis issue
+  # https://github.com/travis-ci/travis-ci/issues/8361
+  - if [[ "${TRAVIS_OS_NAME}" == "linux" ]]; then sudo sh -c 'echo 0 > /proc/sys/net/ipv6/conf/all/disable_ipv6'; fi
 
 before_install:
-- nvm install stable
-
-script:
-## Run all the tests
-- make
-- diff -au <(gofmt -s -d cmd) <(printf "")
-- diff -au <(gofmt -s -d pkg) <(printf "")
-- make test GOFLAGS="-timeout 15m -race -v"
-- make coverage
-- node --version
-- cd browser && yarn && yarn test && cd ..
-
-after_success:
-- bash <(curl -s https://codecov.io/bash)
-
-go:
-- '1.10.1'
+ - if [[ "$TRAVIS_OS_NAME" == "linux" ]]; then nvm install stable ; fi

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -58,6 +58,11 @@ func (rulesMap RulesMap) Remove(rulesMap2 RulesMap) {
 			delete(rulesMap, eventName)
 		}
 	}
+}
+
+// MatchSimple - returns true if matching object name and event name in rules map.
+func (rulesMap RulesMap) MatchSimple(eventName Name, objectName string) bool {
+	return rulesMap[eventName].MatchSimple(objectName)
 }
 
 // Match - returns TargetIDSet matching object name and event name in rules map.

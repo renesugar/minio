@@ -1,7 +1,7 @@
 /*
  * Quick - Quick key value store for config files and persistent state files
  *
- * Quick (C) 2015, 2016, 2017 Minio, Inc.
+ * Quick (C) 2015, 2016, 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,8 +27,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-
-	"github.com/tidwall/gjson"
 )
 
 func TestReadVersion(t *testing.T) {
@@ -106,7 +104,7 @@ func TestSaveFailOnDir(t *testing.T) {
 }
 
 func TestCheckData(t *testing.T) {
-	err := checkData(nil)
+	err := CheckData(nil)
 	if err == nil {
 		t.Fatal("Unexpected should fail")
 	}
@@ -117,7 +115,7 @@ func TestCheckData(t *testing.T) {
 		Directories []string
 	}
 	saveMeBadNoVersion := myStructBadNoVersion{"guest", "nopassword", []string{"Work", "Documents", "Music"}}
-	err = checkData(&saveMeBadNoVersion)
+	err = CheckData(&saveMeBadNoVersion)
 	if err == nil {
 		t.Fatal("Unexpected should fail if Version is not set")
 	}
@@ -128,7 +126,7 @@ func TestCheckData(t *testing.T) {
 		Password string
 	}
 	saveMeBadVersionInt := myStructBadVersionInt{1, "guest", "nopassword"}
-	err = checkData(&saveMeBadVersionInt)
+	err = CheckData(&saveMeBadVersionInt)
 	if err == nil {
 		t.Fatal("Unexpected should fail if Version is integer")
 	}
@@ -141,7 +139,7 @@ func TestCheckData(t *testing.T) {
 	}
 
 	saveMeGood := myStructGood{"1", "guest", "nopassword", []string{"Work", "Documents", "Music"}}
-	err = checkData(&saveMeGood)
+	err = CheckData(&saveMeGood)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -505,32 +503,4 @@ func TestDeepDiff(t *testing.T) {
 	//	for i, field := range fields {
 	//		fmt.Printf("DeepDiff[%d]: %s=%v\n", i, field.Name(), field.Value())
 	//	}
-}
-
-func TestCheckDupJSONKeys(t *testing.T) {
-	testCases := []struct {
-		json       string
-		shouldPass bool
-	}{
-		{`{}`, true},
-		{`{"version" : "13"}`, true},
-		{`{"version" : "13", "version": "14"}`, false},
-		{`{"version" : "13", "credential": {"accessKey": "12345"}}`, true},
-		{`{"version" : "13", "credential": {"accessKey": "12345", "accessKey":"12345"}}`, false},
-		{`{"version" : "13", "notify": {"amqp": {"1"}, "webhook":{"3"}}}`, true},
-		{`{"version" : "13", "notify": {"amqp": {"1"}, "amqp":{"3"}}}`, false},
-		{`{"version" : "13", "notify": {"amqp": {"1":{}, "2":{}}}}`, true},
-		{`{"version" : "13", "notify": {"amqp": {"1":{}, "1":{}}}}`, false},
-	}
-
-	for i, testCase := range testCases {
-		err := doCheckDupJSONKeys(gjson.Result{}, gjson.Parse(testCase.json))
-		if testCase.shouldPass && err != nil {
-			t.Errorf("Test %d, should pass but it failed with err = %v", i+1, err)
-		}
-		if !testCase.shouldPass && err == nil {
-			t.Errorf("Test %d, should fail but it succeed.", i+1)
-		}
-	}
-
 }

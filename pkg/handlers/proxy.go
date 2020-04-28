@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,7 +30,6 @@ var (
 	xForwardedPort   = http.CanonicalHeaderKey("X-Forwarded-Port")
 	xForwardedProto  = http.CanonicalHeaderKey("X-Forwarded-Proto")
 	xForwardedScheme = http.CanonicalHeaderKey("X-Forwarded-Scheme")
-	xForwardedServer = http.CanonicalHeaderKey("X-Forwarded-Server")
 	xRealIP          = http.CanonicalHeaderKey("X-Real-IP")
 )
 

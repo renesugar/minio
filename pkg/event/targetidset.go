@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,23 +16,12 @@
 
 package event
 
-import "fmt"
-
 // TargetIDSet - Set representation of TargetIDs.
 type TargetIDSet map[TargetID]struct{}
 
-// ToSlice - returns TargetID slice from TargetIDSet.
-func (set TargetIDSet) ToSlice() []TargetID {
-	keys := make([]TargetID, 0, len(set))
-	for k := range set {
-		keys = append(keys, k)
-	}
-	return keys
-}
-
-// String - returns string representation.
-func (set TargetIDSet) String() string {
-	return fmt.Sprintf("%v", set.ToSlice())
+// IsEmpty returns true if the set is empty.
+func (set TargetIDSet) IsEmpty() bool {
+	return len(set) != 0
 }
 
 // Clone - returns copy of this set.

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -51,6 +51,16 @@ type Rules map[string]TargetIDSet
 // Add - adds pattern and target ID.
 func (rules Rules) Add(pattern string, targetID TargetID) {
 	rules[pattern] = NewTargetIDSet(targetID).Union(rules[pattern])
+}
+
+// MatchSimple - returns true one of the matching object name in rules.
+func (rules Rules) MatchSimple(objectName string) bool {
+	for pattern := range rules {
+		if wildcard.MatchSimple(pattern, objectName) {
+			return true
+		}
+	}
+	return false
 }
 
 // Match - returns TargetIDSet matching object name in rules.

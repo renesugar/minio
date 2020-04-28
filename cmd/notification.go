@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018, 2019 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,44 +21,63 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
-	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"path"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/klauspost/compress/zip"
+	"github.com/minio/minio-go/v6/pkg/set"
+	"github.com/minio/minio/cmd/crypto"
 	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/pkg/auth"
+	bucketsse "github.com/minio/minio/pkg/bucket/encryption"
+	"github.com/minio/minio/pkg/bucket/lifecycle"
+	objectlock "github.com/minio/minio/pkg/bucket/object/lock"
+	"github.com/minio/minio/pkg/bucket/policy"
 	"github.com/minio/minio/pkg/event"
-	"github.com/minio/minio/pkg/hash"
+	"github.com/minio/minio/pkg/madmin"
 	xnet "github.com/minio/minio/pkg/net"
-	"github.com/minio/minio/pkg/policy"
+	"github.com/minio/minio/pkg/sync/errgroup"
+	"github.com/willf/bloom"
 )
 
 // NotificationSys - notification system.
 type NotificationSys struct {
 	sync.RWMutex
 	targetList                 *event.TargetList
+	targetResCh                chan event.TargetIDResult
 	bucketRulesMap             map[string]event.RulesMap
 	bucketRemoteTargetRulesMap map[string]map[event.TargetID]event.RulesMap
-	peerRPCClientMap           map[xnet.Host]*PeerRPCClient
+	peerClients                []*peerRESTClient
 }
 
 // GetARNList - returns available ARNs.
-func (sys *NotificationSys) GetARNList() []string {
+func (sys *NotificationSys) GetARNList(onlyActive bool) []string {
 	arns := []string{}
-	region := globalServerConfig.GetRegion()
-	for _, targetID := range sys.targetList.List() {
-		arns = append(arns, targetID.ToARN(region).String())
+	if sys == nil {
+		return arns
+	}
+	region := globalServerRegion
+	for targetID, target := range sys.targetList.TargetMap() {
+		// httpclient target is part of ListenBucketNotification
+		// which doesn't need to be listed as part of the ARN list
+		// This list is only meant for external targets, filter
+		// this out pro-actively.
+		if !strings.HasPrefix(targetID.ID, "httpclient+") {
+			if onlyActive && !target.HasQueueStore() {
+				if _, err := target.IsActive(); err != nil {
+					continue
+				}
+			}
+			arns = append(arns, targetID.ToARN(region).String())
+		}
 	}
 
 	return arns
-}
-
-// GetPeerRPCClient - returns PeerRPCClient of addr.
-func (sys *NotificationSys) GetPeerRPCClient(addr xnet.Host) *PeerRPCClient {
-	return sys.peerRPCClientMap[addr]
 }
 
 // NotificationPeerErr returns error associated for a remote peer.
@@ -67,157 +86,624 @@ type NotificationPeerErr struct {
 	Err  error     // Error returned by the remote peer for an rpc call
 }
 
-// DeleteBucket - calls DeleteBucket RPC call on all peers.
-func (sys *NotificationSys) DeleteBucket(bucketName string) <-chan NotificationPeerErr {
-	errCh := make(chan NotificationPeerErr)
-	go func() {
-		defer close(errCh)
-
-		var wg sync.WaitGroup
-		for addr, client := range sys.peerRPCClientMap {
-			wg.Add(1)
-			go func(addr xnet.Host, client *PeerRPCClient) {
-				defer wg.Done()
-				if err := client.DeleteBucket(bucketName); err != nil {
-					errCh <- NotificationPeerErr{
-						Host: addr,
-						Err:  err,
-					}
-				}
-			}(addr, client)
-		}
-		wg.Wait()
-	}()
-
-	return errCh
+// A NotificationGroup is a collection of goroutines working on subtasks that are part of
+// the same overall task.
+//
+// A zero NotificationGroup is valid and does not cancel on error.
+type NotificationGroup struct {
+	wg   sync.WaitGroup
+	errs []NotificationPeerErr
 }
 
-// SetCredentials - calls SetCredentials RPC call on all peers.
-func (sys *NotificationSys) SetCredentials(credentials auth.Credentials) map[xnet.Host]error {
-	errors := make(map[xnet.Host]error)
-	var wg sync.WaitGroup
-	for addr, client := range sys.peerRPCClientMap {
-		wg.Add(1)
-		go func(addr xnet.Host, client *PeerRPCClient) {
-			defer wg.Done()
-			// Try to set credentials in three attempts.
-			for i := 0; i < 3; i++ {
-				err := client.SetCredentials(credentials)
-				if err == nil {
-					break
+// WithNPeers returns a new NotificationGroup with length of errs slice upto nerrs,
+// upon Wait() errors are returned collected from all tasks.
+func WithNPeers(nerrs int) *NotificationGroup {
+	return &NotificationGroup{errs: make([]NotificationPeerErr, nerrs)}
+}
+
+// Wait blocks until all function calls from the Go method have returned, then
+// returns the slice of errors from all function calls.
+func (g *NotificationGroup) Wait() []NotificationPeerErr {
+	g.wg.Wait()
+	return g.errs
+}
+
+// Go calls the given function in a new goroutine.
+//
+// The first call to return a non-nil error will be
+// collected in errs slice and returned by Wait().
+func (g *NotificationGroup) Go(ctx context.Context, f func() error, index int, addr xnet.Host) {
+	g.wg.Add(1)
+
+	go func() {
+		defer g.wg.Done()
+		g.errs[index] = NotificationPeerErr{
+			Host: addr,
+		}
+		for i := 0; i < 3; i++ {
+			if err := f(); err != nil {
+				g.errs[index].Err = err
+				// Last iteration log the error.
+				if i == 2 {
+					reqInfo := (&logger.ReqInfo{}).AppendTags("peerAddress", addr.String())
+					ctx := logger.SetReqInfo(ctx, reqInfo)
+					logger.LogIf(ctx, err)
 				}
-				errors[addr] = err
+				// Wait for one second and no need wait after last attempt.
+				if i < 2 {
+					time.Sleep(1 * time.Second)
+				}
+				continue
+			}
+			break
+		}
+	}()
+}
+
+// ReloadFormat - calls ReloadFormat REST call on all peers.
+func (sys *NotificationSys) ReloadFormat(dryRun bool) []NotificationPeerErr {
+	ng := WithNPeers(len(sys.peerClients))
+	for idx, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		client := client
+		ng.Go(GlobalContext, func() error {
+			return client.ReloadFormat(dryRun)
+		}, idx, *client.host)
+	}
+	return ng.Wait()
+}
+
+// DeletePolicy - deletes policy across all peers.
+func (sys *NotificationSys) DeletePolicy(policyName string) []NotificationPeerErr {
+	ng := WithNPeers(len(sys.peerClients))
+	for idx, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		client := client
+		ng.Go(GlobalContext, func() error {
+			return client.DeletePolicy(policyName)
+		}, idx, *client.host)
+	}
+	return ng.Wait()
+}
+
+// LoadPolicy - reloads a specific modified policy across all peers
+func (sys *NotificationSys) LoadPolicy(policyName string) []NotificationPeerErr {
+	ng := WithNPeers(len(sys.peerClients))
+	for idx, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		client := client
+		ng.Go(GlobalContext, func() error {
+			return client.LoadPolicy(policyName)
+		}, idx, *client.host)
+	}
+	return ng.Wait()
+}
+
+// LoadPolicyMapping - reloads a policy mapping across all peers
+func (sys *NotificationSys) LoadPolicyMapping(userOrGroup string, isGroup bool) []NotificationPeerErr {
+	ng := WithNPeers(len(sys.peerClients))
+	for idx, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		client := client
+		ng.Go(GlobalContext, func() error {
+			return client.LoadPolicyMapping(userOrGroup, isGroup)
+		}, idx, *client.host)
+	}
+	return ng.Wait()
+}
+
+// DeleteUser - deletes a specific user across all peers
+func (sys *NotificationSys) DeleteUser(accessKey string) []NotificationPeerErr {
+	ng := WithNPeers(len(sys.peerClients))
+	for idx, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		client := client
+		ng.Go(GlobalContext, func() error {
+			return client.DeleteUser(accessKey)
+		}, idx, *client.host)
+	}
+	return ng.Wait()
+}
+
+// LoadUser - reloads a specific user across all peers
+func (sys *NotificationSys) LoadUser(accessKey string, temp bool) []NotificationPeerErr {
+	ng := WithNPeers(len(sys.peerClients))
+	for idx, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		client := client
+		ng.Go(GlobalContext, func() error {
+			return client.LoadUser(accessKey, temp)
+		}, idx, *client.host)
+	}
+	return ng.Wait()
+}
+
+// LoadGroup - loads a specific group on all peers.
+func (sys *NotificationSys) LoadGroup(group string) []NotificationPeerErr {
+	ng := WithNPeers(len(sys.peerClients))
+	for idx, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		client := client
+		ng.Go(GlobalContext, func() error { return client.LoadGroup(group) }, idx, *client.host)
+	}
+	return ng.Wait()
+}
+
+// DeleteServiceAccount - deletes a specific service account across all peers
+func (sys *NotificationSys) DeleteServiceAccount(accessKey string) []NotificationPeerErr {
+	ng := WithNPeers(len(sys.peerClients))
+	for idx, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		client := client
+		ng.Go(GlobalContext, func() error {
+			return client.DeleteServiceAccount(accessKey)
+		}, idx, *client.host)
+	}
+	return ng.Wait()
+}
+
+// LoadServiceAccount - reloads a specific service account across all peers
+func (sys *NotificationSys) LoadServiceAccount(accessKey string) []NotificationPeerErr {
+	ng := WithNPeers(len(sys.peerClients))
+	for idx, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		client := client
+		ng.Go(GlobalContext, func() error {
+			return client.LoadServiceAccount(accessKey)
+		}, idx, *client.host)
+	}
+	return ng.Wait()
+}
+
+// BackgroundHealStatus - returns background heal status of all peers
+func (sys *NotificationSys) BackgroundHealStatus() []madmin.BgHealState {
+	states := make([]madmin.BgHealState, len(sys.peerClients))
+	for idx, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		st, err := client.BackgroundHealStatus()
+		if err != nil {
+			logger.LogIf(GlobalContext, err)
+		} else {
+			states[idx] = st
+		}
+	}
+
+	return states
+}
+
+// StartProfiling - start profiling on remote peers, by initiating a remote RPC.
+func (sys *NotificationSys) StartProfiling(profiler string) []NotificationPeerErr {
+	ng := WithNPeers(len(sys.peerClients))
+	for idx, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		client := client
+		ng.Go(GlobalContext, func() error {
+			return client.StartProfiling(profiler)
+		}, idx, *client.host)
+	}
+	return ng.Wait()
+}
+
+// DownloadProfilingData - download profiling data from all remote peers.
+func (sys *NotificationSys) DownloadProfilingData(ctx context.Context, writer io.Writer) bool {
+	profilingDataFound := false
+
+	// Initialize a zip writer which will provide a zipped content
+	// of profiling data of all nodes
+	zipWriter := zip.NewWriter(writer)
+	defer zipWriter.Close()
+
+	for _, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		data, err := client.DownloadProfileData()
+		if err != nil {
+			reqInfo := (&logger.ReqInfo{}).AppendTags("peerAddress", client.host.String())
+			ctx := logger.SetReqInfo(ctx, reqInfo)
+			logger.LogIf(ctx, err)
+			continue
+		}
+
+		profilingDataFound = true
+
+		for typ, data := range data {
+			// Send profiling data to zip as file
+			header, zerr := zip.FileInfoHeader(dummyFileInfo{
+				name:    fmt.Sprintf("profile-%s-%s", client.host.String(), typ),
+				size:    int64(len(data)),
+				mode:    0600,
+				modTime: UTCNow(),
+				isDir:   false,
+				sys:     nil,
+			})
+			if zerr != nil {
+				reqInfo := (&logger.ReqInfo{}).AppendTags("peerAddress", client.host.String())
+				ctx := logger.SetReqInfo(ctx, reqInfo)
+				logger.LogIf(ctx, zerr)
+				continue
+			}
+			zwriter, zerr := zipWriter.CreateHeader(header)
+			if zerr != nil {
+				reqInfo := (&logger.ReqInfo{}).AppendTags("peerAddress", client.host.String())
+				ctx := logger.SetReqInfo(ctx, reqInfo)
+				logger.LogIf(ctx, zerr)
+				continue
+			}
+			if _, err = io.Copy(zwriter, bytes.NewBuffer(data)); err != nil {
+				reqInfo := (&logger.ReqInfo{}).AppendTags("peerAddress", client.host.String())
+				ctx := logger.SetReqInfo(ctx, reqInfo)
+				logger.LogIf(ctx, err)
+				continue
+			}
+		}
+	}
+
+	// Local host
+	thisAddr, err := xnet.ParseHost(GetLocalPeer(globalEndpoints))
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return profilingDataFound
+	}
+
+	data, err := getProfileData()
+	if err != nil {
+		reqInfo := (&logger.ReqInfo{}).AppendTags("peerAddress", thisAddr.String())
+		ctx := logger.SetReqInfo(ctx, reqInfo)
+		logger.LogIf(ctx, err)
+		return profilingDataFound
+	}
+
+	profilingDataFound = true
+
+	// Send profiling data to zip as file
+	for typ, data := range data {
+		header, zerr := zip.FileInfoHeader(dummyFileInfo{
+			name:    fmt.Sprintf("profile-%s-%s", thisAddr, typ),
+			size:    int64(len(data)),
+			mode:    0600,
+			modTime: UTCNow(),
+			isDir:   false,
+			sys:     nil,
+		})
+		if zerr != nil {
+			return profilingDataFound
+		}
+
+		zwriter, zerr := zipWriter.CreateHeader(header)
+		if zerr != nil {
+			return profilingDataFound
+		}
+
+		if _, err = io.Copy(zwriter, bytes.NewBuffer(data)); err != nil {
+			return profilingDataFound
+		}
+	}
+
+	return profilingDataFound
+}
+
+// ServerUpdate - updates remote peers.
+func (sys *NotificationSys) ServerUpdate(updateURL, sha256Hex string, latestReleaseTime time.Time) []NotificationPeerErr {
+	ng := WithNPeers(len(sys.peerClients))
+	for idx, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		client := client
+		ng.Go(GlobalContext, func() error {
+			return client.ServerUpdate(updateURL, sha256Hex, latestReleaseTime)
+		}, idx, *client.host)
+	}
+	return ng.Wait()
+}
+
+// SignalService - calls signal service RPC call on all peers.
+func (sys *NotificationSys) SignalService(sig serviceSignal) []NotificationPeerErr {
+	ng := WithNPeers(len(sys.peerClients))
+	for idx, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		client := client
+		ng.Go(GlobalContext, func() error {
+			return client.SignalService(sig)
+		}, idx, *client.host)
+	}
+	return ng.Wait()
+}
+
+// updateBloomFilter will cycle all servers to the current index and
+// return a merged bloom filter if a complete one can be retrieved.
+func (sys *NotificationSys) updateBloomFilter(ctx context.Context, current uint64) (*bloomFilter, error) {
+	var req = bloomFilterRequest{
+		Current: current,
+		Oldest:  current - dataUsageUpdateDirCycles,
+	}
+	if current < dataUsageUpdateDirCycles {
+		req.Oldest = 0
+	}
+
+	// Load initial state from local...
+	var bf *bloomFilter
+	bfr, err := intDataUpdateTracker.cycleFilter(ctx, req.Oldest, req.Current)
+	logger.LogIf(ctx, err)
+	if err == nil && bfr.Complete {
+		nbf := intDataUpdateTracker.newBloomFilter()
+		bf = &nbf
+		_, err = bf.ReadFrom(bytes.NewBuffer(bfr.Filter))
+		logger.LogIf(ctx, err)
+	}
+
+	var mu sync.Mutex
+	g := errgroup.WithNErrs(len(sys.peerClients))
+	for idx, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		client := client
+		g.Go(func() error {
+			serverBF, err := client.cycleServerBloomFilter(ctx, req)
+			if false && intDataUpdateTracker.debug {
+				b, _ := json.MarshalIndent(serverBF, "", "  ")
+				logger.Info("Disk %v, Bloom filter: %v", client.host.Name, string(b))
+			}
+			// Keep lock while checking result.
+			mu.Lock()
+			defer mu.Unlock()
+
+			if err != nil || !serverBF.Complete || bf == nil {
+				logger.LogIf(ctx, err)
+				bf = nil
+				return nil
+			}
+
+			var tmp bloom.BloomFilter
+			_, err = tmp.ReadFrom(bytes.NewBuffer(serverBF.Filter))
+			if err != nil {
+				logger.LogIf(ctx, err)
+				bf = nil
+				return nil
+			}
+			if bf.BloomFilter == nil {
+				bf.BloomFilter = &tmp
+			} else {
+				err = bf.Merge(&tmp)
+				if err != nil {
+					logger.LogIf(ctx, err)
+					bf = nil
+					return nil
+				}
+			}
+			return nil
+		}, idx)
+	}
+	g.Wait()
+	return bf, nil
+}
+
+// GetLocks - makes GetLocks RPC call on all peers.
+func (sys *NotificationSys) GetLocks(ctx context.Context) []*PeerLocks {
+	locksResp := make([]*PeerLocks, len(sys.peerClients))
+	g := errgroup.WithNErrs(len(sys.peerClients))
+	for index, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		index := index
+		g.Go(func() error {
+			// Try to fetch serverInfo remotely in three attempts.
+			for i := 0; i < 3; i++ {
+				serverLocksResp, err := sys.peerClients[index].GetLocks()
+				if err == nil {
+					locksResp[index] = &PeerLocks{
+						Addr:  sys.peerClients[index].host.String(),
+						Locks: serverLocksResp,
+					}
+					return nil
+				}
+
+				// Last iteration log the error.
+				if i == 2 {
+					return err
+				}
 				// Wait for one second and no need wait after last attempt.
 				if i < 2 {
 					time.Sleep(1 * time.Second)
 				}
 			}
-		}(addr, client)
+			return nil
+		}, index)
 	}
-	wg.Wait()
-
-	return errors
+	for index, err := range g.Wait() {
+		reqInfo := (&logger.ReqInfo{}).AppendTags("peerAddress",
+			sys.peerClients[index].host.String())
+		ctx := logger.SetReqInfo(ctx, reqInfo)
+		logger.LogOnceIf(ctx, err, sys.peerClients[index].host.String())
+	}
+	return locksResp
 }
 
 // SetBucketPolicy - calls SetBucketPolicy RPC call on all peers.
-func (sys *NotificationSys) SetBucketPolicy(bucketName string, bucketPolicy *policy.Policy) <-chan NotificationPeerErr {
-	errCh := make(chan NotificationPeerErr)
+func (sys *NotificationSys) SetBucketPolicy(ctx context.Context, bucketName string, bucketPolicy *policy.Policy) {
 	go func() {
-		defer close(errCh)
-
-		var wg sync.WaitGroup
-		for addr, client := range sys.peerRPCClientMap {
-			wg.Add(1)
-			go func(addr xnet.Host, client *PeerRPCClient) {
-				defer wg.Done()
-				if err := client.SetBucketPolicy(bucketName, bucketPolicy); err != nil {
-					errCh <- NotificationPeerErr{
-						Host: addr,
-						Err:  err,
-					}
-				}
-			}(addr, client)
+		ng := WithNPeers(len(sys.peerClients))
+		for idx, client := range sys.peerClients {
+			if client == nil {
+				continue
+			}
+			client := client
+			ng.Go(ctx, func() error {
+				return client.SetBucketPolicy(bucketName, bucketPolicy)
+			}, idx, *client.host)
 		}
-		wg.Wait()
+		ng.Wait()
 	}()
+}
 
-	return errCh
+// DeleteBucket - calls DeleteBucket RPC call on all peers.
+func (sys *NotificationSys) DeleteBucket(ctx context.Context, bucketName string) {
+	globalNotificationSys.RemoveNotification(bucketName)
+	globalBucketObjectLockConfig.Remove(bucketName)
+	globalPolicySys.Remove(bucketName)
+	globalLifecycleSys.Remove(bucketName)
+
+	go func() {
+		ng := WithNPeers(len(sys.peerClients))
+		for idx, client := range sys.peerClients {
+			if client == nil {
+				continue
+			}
+			client := client
+			ng.Go(ctx, func() error {
+				return client.DeleteBucket(bucketName)
+			}, idx, *client.host)
+		}
+		ng.Wait()
+	}()
 }
 
 // RemoveBucketPolicy - calls RemoveBucketPolicy RPC call on all peers.
-func (sys *NotificationSys) RemoveBucketPolicy(bucketName string) <-chan NotificationPeerErr {
-	errCh := make(chan NotificationPeerErr)
+func (sys *NotificationSys) RemoveBucketPolicy(ctx context.Context, bucketName string) {
 	go func() {
-		defer close(errCh)
-
-		var wg sync.WaitGroup
-		for addr, client := range sys.peerRPCClientMap {
-			wg.Add(1)
-			go func(addr xnet.Host, client *PeerRPCClient) {
-				defer wg.Done()
-				if err := client.RemoveBucketPolicy(bucketName); err != nil {
-					errCh <- NotificationPeerErr{
-						Host: addr,
-						Err:  err,
-					}
-				}
-			}(addr, client)
+		ng := WithNPeers(len(sys.peerClients))
+		for idx, client := range sys.peerClients {
+			if client == nil {
+				continue
+			}
+			client := client
+			ng.Go(ctx, func() error {
+				return client.RemoveBucketPolicy(bucketName)
+			}, idx, *client.host)
 		}
-		wg.Wait()
+		ng.Wait()
 	}()
+}
 
-	return errCh
+// RemoveBucketObjectLockConfig - calls RemoveBucketObjectLockConfig RPC call on all peers.
+func (sys *NotificationSys) RemoveBucketObjectLockConfig(ctx context.Context, bucketName string) {
+	go func() {
+		ng := WithNPeers(len(sys.peerClients))
+		for idx, client := range sys.peerClients {
+			if client == nil {
+				continue
+			}
+			client := client
+			ng.Go(ctx, func() error {
+				return client.RemoveBucketObjectLockConfig(bucketName)
+			}, idx, *client.host)
+		}
+		ng.Wait()
+	}()
+}
+
+// SetBucketLifecycle - calls SetBucketLifecycle on all peers.
+func (sys *NotificationSys) SetBucketLifecycle(ctx context.Context, bucketName string,
+	bucketLifecycle *lifecycle.Lifecycle) {
+	go func() {
+		ng := WithNPeers(len(sys.peerClients))
+		for idx, client := range sys.peerClients {
+			if client == nil {
+				continue
+			}
+			client := client
+			ng.Go(ctx, func() error {
+				return client.SetBucketLifecycle(bucketName, bucketLifecycle)
+			}, idx, *client.host)
+		}
+		ng.Wait()
+	}()
+}
+
+// RemoveBucketLifecycle - calls RemoveLifecycle on all peers.
+func (sys *NotificationSys) RemoveBucketLifecycle(ctx context.Context, bucketName string) {
+	go func() {
+		ng := WithNPeers(len(sys.peerClients))
+		for idx, client := range sys.peerClients {
+			if client == nil {
+				continue
+			}
+			client := client
+			ng.Go(ctx, func() error {
+				return client.RemoveBucketLifecycle(bucketName)
+			}, idx, *client.host)
+		}
+		ng.Wait()
+	}()
+}
+
+// SetBucketSSEConfig - calls SetBucketSSEConfig on all peers.
+func (sys *NotificationSys) SetBucketSSEConfig(ctx context.Context, bucketName string,
+	encConfig *bucketsse.BucketSSEConfig) {
+	go func() {
+		ng := WithNPeers(len(sys.peerClients))
+		for idx, client := range sys.peerClients {
+			if client == nil {
+				continue
+			}
+			client := client
+			ng.Go(ctx, func() error {
+				return client.SetBucketSSEConfig(bucketName, encConfig)
+			}, idx, *client.host)
+		}
+		ng.Wait()
+	}()
+}
+
+// RemoveBucketSSEConfig - calls RemoveBucketSSEConfig on all peers.
+func (sys *NotificationSys) RemoveBucketSSEConfig(ctx context.Context, bucketName string) {
+	go func() {
+		ng := WithNPeers(len(sys.peerClients))
+		for idx, client := range sys.peerClients {
+			if client == nil {
+				continue
+			}
+			client := client
+			ng.Go(ctx, func() error {
+				return client.RemoveBucketSSEConfig(bucketName)
+			}, idx, *client.host)
+		}
+		ng.Wait()
+	}()
 }
 
 // PutBucketNotification - calls PutBucketNotification RPC call on all peers.
-func (sys *NotificationSys) PutBucketNotification(bucketName string, rulesMap event.RulesMap) <-chan NotificationPeerErr {
-	errCh := make(chan NotificationPeerErr)
+func (sys *NotificationSys) PutBucketNotification(ctx context.Context, bucketName string, rulesMap event.RulesMap) {
 	go func() {
-		defer close(errCh)
-
-		var wg sync.WaitGroup
-		for addr, client := range sys.peerRPCClientMap {
-			wg.Add(1)
-			go func(addr xnet.Host, client *PeerRPCClient, rulesMap event.RulesMap) {
-				defer wg.Done()
-				if err := client.PutBucketNotification(bucketName, rulesMap); err != nil {
-					errCh <- NotificationPeerErr{
-						Host: addr,
-						Err:  err,
-					}
-				}
-			}(addr, client, rulesMap.Clone())
+		ng := WithNPeers(len(sys.peerClients))
+		for idx, client := range sys.peerClients {
+			if client == nil {
+				continue
+			}
+			client := client
+			ng.Go(ctx, func() error {
+				return client.PutBucketNotification(bucketName, rulesMap)
+			}, idx, *client.host)
 		}
-		wg.Wait()
+		ng.Wait()
 	}()
-
-	return errCh
-}
-
-// ListenBucketNotification - calls ListenBucketNotification RPC call on all peers.
-func (sys *NotificationSys) ListenBucketNotification(bucketName string, eventNames []event.Name, pattern string,
-	targetID event.TargetID, localPeer xnet.Host) <-chan NotificationPeerErr {
-	errCh := make(chan NotificationPeerErr)
-	go func() {
-		defer close(errCh)
-
-		var wg sync.WaitGroup
-		for addr, client := range sys.peerRPCClientMap {
-			wg.Add(1)
-			go func(addr xnet.Host, client *PeerRPCClient) {
-				defer wg.Done()
-				if err := client.ListenBucketNotification(bucketName, eventNames, pattern, targetID, localPeer); err != nil {
-					errCh <- NotificationPeerErr{
-						Host: addr,
-						Err:  err,
-					}
-				}
-			}(addr, client)
-		}
-		wg.Wait()
-	}()
-
-	return errCh
 }
 
 // AddRemoteTarget - adds event rules map, HTTP/PeerRPC client target to bucket name.
@@ -231,142 +717,70 @@ func (sys *NotificationSys) AddRemoteTarget(bucketName string, target event.Targ
 	if targetMap == nil {
 		targetMap = make(map[event.TargetID]event.RulesMap)
 	}
-	targetMap[target.ID()] = rulesMap.Clone()
+
+	rulesMap = rulesMap.Clone()
+	targetMap[target.ID()] = rulesMap
 	sys.bucketRemoteTargetRulesMap[bucketName] = targetMap
+
+	rulesMap = rulesMap.Clone()
+	rulesMap.Add(sys.bucketRulesMap[bucketName])
+	sys.bucketRulesMap[bucketName] = rulesMap
+
 	sys.Unlock()
 
-	sys.AddRulesMap(bucketName, rulesMap)
 	return nil
 }
 
-// RemoteTargetExist - checks whether given target ID is a HTTP/PeerRPC client target or not.
-func (sys *NotificationSys) RemoteTargetExist(bucketName string, targetID event.TargetID) bool {
-	sys.Lock()
-	defer sys.Unlock()
-
-	targetMap, ok := sys.bucketRemoteTargetRulesMap[bucketName]
-	if ok {
-		_, ok = targetMap[targetID]
-	}
-
-	return ok
-}
-
-// initListeners - initializes PeerRPC clients available in listener.json.
-func (sys *NotificationSys) initListeners(ctx context.Context, objAPI ObjectLayer, bucketName string) error {
-	// listener.json is available/applicable only in DistXL mode.
-	if !globalIsDistXL {
-		return nil
-	}
-
-	// Construct path to listener.json for the given bucket.
-	configFile := path.Join(bucketConfigPrefix, bucketName, bucketListenerConfig)
-	transactionConfigFile := configFile + ".transaction"
-
-	// As object layer's GetObject() and PutObject() take respective lock on minioMetaBucket
-	// and configFile, take a transaction lock to avoid data race between readConfig()
-	// and saveConfig().
-	objLock := globalNSMutex.NewNSLock(minioMetaBucket, transactionConfigFile)
-	if err := objLock.GetLock(globalOperationTimeout); err != nil {
-		return err
-	}
-	defer objLock.Unlock()
-
-	reader, e := readConfig(ctx, objAPI, configFile)
-	if e != nil && !IsErrIgnored(e, errDiskNotFound, errConfigNotFound) {
-		return e
-	}
-
-	listenerList := []ListenBucketNotificationArgs{}
-	if reader != nil {
-		err := json.NewDecoder(reader).Decode(&listenerList)
-		if err != nil {
-			logger.LogIf(ctx, err)
+// Loads notification policies for all buckets into NotificationSys.
+func (sys *NotificationSys) load(buckets []BucketInfo, objAPI ObjectLayer) error {
+	for _, bucket := range buckets {
+		ctx := logger.SetReqInfo(GlobalContext, &logger.ReqInfo{BucketName: bucket.Name})
+		config, err := readNotificationConfig(ctx, objAPI, bucket.Name)
+		if err != nil && err != errNoSuchNotifications {
+			if _, ok := err.(*event.ErrARNNotFound); ok {
+				continue
+			}
 			return err
 		}
-	}
-
-	if len(listenerList) == 0 {
-		// Nothing to initialize for empty listener list.
-		return nil
-	}
-
-	activeListenerList := []ListenBucketNotificationArgs{}
-	for _, args := range listenerList {
-		found, err := isLocalHost(args.Addr.Name)
-		if err != nil {
-			logger.GetReqInfo(ctx).AppendTags("host", args.Addr.Name)
-			logger.LogIf(ctx, err)
-			return err
-		}
-		if found {
-			// As this function is called at startup, skip HTTP listener to this host.
+		if err == errNoSuchNotifications {
 			continue
 		}
-
-		rpcClient := sys.GetPeerRPCClient(args.Addr)
-		if rpcClient == nil {
-			return fmt.Errorf("unable to find PeerRPCClient by address %v in listener.json for bucket %v", args.Addr, bucketName)
-		}
-
-		exist, err := rpcClient.RemoteTargetExist(bucketName, args.TargetID)
-		if err != nil {
-			logger.GetReqInfo(ctx).AppendTags("targetID", args.TargetID.Name)
-			logger.LogIf(ctx, err)
-			return err
-		}
-		if !exist {
-			// Skip previously connected HTTP listener which is not found in remote peer.
-			continue
-		}
-
-		target := NewPeerRPCClientTarget(bucketName, args.TargetID, rpcClient)
-		rulesMap := event.NewRulesMap(args.EventNames, args.Pattern, target.ID())
-		if err = sys.AddRemoteTarget(bucketName, target, rulesMap); err != nil {
-			logger.GetReqInfo(ctx).AppendTags("targetName", target.id.Name)
-			logger.LogIf(ctx, err)
-			return err
-		}
-		activeListenerList = append(activeListenerList, args)
+		sys.AddRulesMap(bucket.Name, config.ToRulesMap())
 	}
-
-	data, err := json.Marshal(activeListenerList)
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return err
-	}
-
-	return saveConfig(objAPI, configFile, data)
+	return nil
 }
 
 // Init - initializes notification system from notification.xml and listener.json of all buckets.
-func (sys *NotificationSys) Init(objAPI ObjectLayer) error {
+func (sys *NotificationSys) Init(buckets []BucketInfo, objAPI ObjectLayer) error {
 	if objAPI == nil {
 		return errInvalidArgument
 	}
 
-	buckets, err := objAPI.ListBuckets(context.Background())
-	if err != nil {
-		return err
+	// In gateway mode, notifications are not supported.
+	if globalIsGateway && !objAPI.IsNotificationSupported() {
+		return nil
 	}
 
-	for _, bucket := range buckets {
-		ctx := logger.SetReqInfo(context.Background(), &logger.ReqInfo{BucketName: bucket.Name})
-		config, err := readNotificationConfig(ctx, objAPI, bucket.Name)
-		if err != nil {
-			if !IsErrIgnored(err, errDiskNotFound, errNoSuchNotifications) {
+	if globalConfigTargetList != nil {
+		for _, target := range globalConfigTargetList.Targets() {
+			if err := sys.targetList.Add(target); err != nil {
 				return err
 			}
-		} else {
-			sys.AddRulesMap(bucket.Name, config.ToRulesMap())
-		}
-
-		if err = sys.initListeners(ctx, objAPI, bucket.Name); err != nil {
-			return err
 		}
 	}
 
-	return nil
+	go func() {
+		for res := range sys.targetResCh {
+			if res.Err != nil {
+				reqInfo := &logger.ReqInfo{}
+				reqInfo.AppendTags("targetID", res.ID.Name)
+				ctx := logger.SetReqInfo(GlobalContext, reqInfo)
+				logger.LogOnceIf(ctx, res.Err, res.ID)
+			}
+		}
+	}()
+
+	return sys.load(buckets, objAPI)
 }
 
 // AddRulesMap - adds rules map for bucket name.
@@ -380,8 +794,12 @@ func (sys *NotificationSys) AddRulesMap(bucketName string, rulesMap event.RulesM
 		rulesMap.Add(targetRulesMap)
 	}
 
-	rulesMap.Add(sys.bucketRulesMap[bucketName])
-	sys.bucketRulesMap[bucketName] = rulesMap
+	// Do not add for an empty rulesMap.
+	if len(rulesMap) == 0 {
+		delete(sys.bucketRulesMap, bucketName)
+	} else {
+		sys.bucketRulesMap[bucketName] = rulesMap
+	}
 }
 
 // RemoveRulesMap - removes rules map for bucket name.
@@ -395,6 +813,35 @@ func (sys *NotificationSys) RemoveRulesMap(bucketName string, rulesMap event.Rul
 	}
 }
 
+// ConfiguredTargetIDs - returns list of configured target id's
+func (sys *NotificationSys) ConfiguredTargetIDs() []event.TargetID {
+	if sys == nil {
+		return nil
+	}
+
+	sys.RLock()
+	defer sys.RUnlock()
+
+	var targetIDs []event.TargetID
+	for _, rmap := range sys.bucketRulesMap {
+		for _, rules := range rmap {
+			for _, targetSet := range rules {
+				for id := range targetSet {
+					targetIDs = append(targetIDs, id)
+				}
+			}
+		}
+	}
+	// Filter out targets configured via env
+	var tIDs []event.TargetID
+	for _, targetID := range targetIDs {
+		if !globalEnvTargetList.Exists(targetID) {
+			tIDs = append(tIDs, targetID)
+		}
+	}
+	return tIDs
+}
+
 // RemoveNotification - removes all notification configuration for bucket name.
 func (sys *NotificationSys) RemoveNotification(bucketName string) {
 	sys.Lock()
@@ -402,140 +849,464 @@ func (sys *NotificationSys) RemoveNotification(bucketName string) {
 
 	delete(sys.bucketRulesMap, bucketName)
 
+	targetIDSet := event.NewTargetIDSet()
 	for targetID := range sys.bucketRemoteTargetRulesMap[bucketName] {
-		sys.targetList.Remove(targetID)
+		targetIDSet[targetID] = struct{}{}
 		delete(sys.bucketRemoteTargetRulesMap[bucketName], targetID)
 	}
+	sys.targetList.Remove(targetIDSet)
 
 	delete(sys.bucketRemoteTargetRulesMap, bucketName)
 }
 
-// RemoveAllRemoteTargets - closes and removes all HTTP/PeerRPC client targets.
+// RemoveAllRemoteTargets - closes and removes all notification targets.
 func (sys *NotificationSys) RemoveAllRemoteTargets() {
-	for _, targetMap := range sys.bucketRemoteTargetRulesMap {
-		for targetID := range targetMap {
-			sys.targetList.Remove(targetID)
-		}
-	}
-}
-
-// RemoveRemoteTarget - closes and removes target by target ID.
-func (sys *NotificationSys) RemoveRemoteTarget(bucketName string, targetID event.TargetID) {
-	for terr := range sys.targetList.Remove(targetID) {
-		reqInfo := (&logger.ReqInfo{}).AppendTags("targetID", terr.ID.Name)
-		ctx := logger.SetReqInfo(context.Background(), reqInfo)
-		logger.LogIf(ctx, terr.Err)
-	}
-
 	sys.Lock()
 	defer sys.Unlock()
 
-	if _, ok := sys.bucketRemoteTargetRulesMap[bucketName]; ok {
-		delete(sys.bucketRemoteTargetRulesMap[bucketName], targetID)
-		if len(sys.bucketRemoteTargetRulesMap[bucketName]) == 0 {
-			delete(sys.bucketRemoteTargetRulesMap, bucketName)
+	for _, targetMap := range sys.bucketRemoteTargetRulesMap {
+		targetIDSet := event.NewTargetIDSet()
+		for k := range targetMap {
+			targetIDSet[k] = struct{}{}
 		}
+		sys.targetList.Remove(targetIDSet)
 	}
-}
-
-func (sys *NotificationSys) send(bucketName string, eventData event.Event, targetIDs ...event.TargetID) (errs []event.TargetIDErr) {
-	errCh := sys.targetList.Send(eventData, targetIDs...)
-	for terr := range errCh {
-		errs = append(errs, terr)
-		if sys.RemoteTargetExist(bucketName, terr.ID) {
-			sys.RemoveRemoteTarget(bucketName, terr.ID)
-		}
-	}
-
-	return errs
 }
 
 // Send - sends event data to all matching targets.
-func (sys *NotificationSys) Send(args eventArgs) []event.TargetIDErr {
+func (sys *NotificationSys) Send(args eventArgs) {
 	sys.RLock()
 	targetIDSet := sys.bucketRulesMap[args.BucketName].Match(args.EventName, args.Object.Name)
 	sys.RUnlock()
+
 	if len(targetIDSet) == 0 {
+		return
+	}
+
+	sys.targetList.Send(args.ToEvent(true), targetIDSet, sys.targetResCh)
+}
+
+// PutBucketObjectLockConfig - put bucket object lock configuration to all peers.
+func (sys *NotificationSys) PutBucketObjectLockConfig(ctx context.Context, bucketName string, retention objectlock.Retention) {
+	g := errgroup.WithNErrs(len(sys.peerClients))
+	for index, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		index := index
+		g.Go(func() error {
+			return sys.peerClients[index].PutBucketObjectLockConfig(bucketName, retention)
+		}, index)
+	}
+	for i, err := range g.Wait() {
+		if err != nil {
+			logger.GetReqInfo(ctx).AppendTags("remotePeer", sys.peerClients[i].host.String())
+			logger.LogIf(ctx, err)
+		}
+	}
+}
+
+// NetOBDInfo - Net OBD information
+func (sys *NotificationSys) NetOBDInfo(ctx context.Context) madmin.ServerNetOBDInfo {
+	var sortedGlobalEndpoints []string
+
+	/*
+			Ensure that only untraversed links are visited by this server
+		        i.e. if netOBD tests have been performed between a -> b, then do
+			not run it between b -> a
+
+		        The graph of tests looks like this
+
+		            a   b   c   d
+		        a | o | x | x | x |
+		        b | o | o | x | x |
+		        c | o | o | o | x |
+		        d | o | o | o | o |
+
+		        'x's should be tested, and 'o's should be skipped
+	*/
+
+	hostSet := set.NewStringSet()
+	for _, ez := range globalEndpoints {
+		for _, e := range ez.Endpoints {
+			if !hostSet.Contains(e.Host) {
+				sortedGlobalEndpoints = append(sortedGlobalEndpoints, e.Host)
+				hostSet.Add(e.Host)
+			}
+		}
+	}
+
+	sort.Strings(sortedGlobalEndpoints)
+	var remoteTargets []*peerRESTClient
+	search := func(host string) *peerRESTClient {
+		for index, client := range sys.peerClients {
+			if client == nil {
+				continue
+			}
+			if sys.peerClients[index].host.String() == host {
+				return client
+			}
+		}
 		return nil
 	}
 
-	targetIDs := targetIDSet.ToSlice()
-	return sys.send(args.BucketName, args.ToEvent(), targetIDs...)
+	for i := 0; i < len(sortedGlobalEndpoints); i++ {
+		if sortedGlobalEndpoints[i] != GetLocalPeer(globalEndpoints) {
+			continue
+		}
+		for j := 0; j < len(sortedGlobalEndpoints); j++ {
+			if j > i {
+				remoteTarget := search(sortedGlobalEndpoints[j])
+				if remoteTarget != nil {
+					remoteTargets = append(remoteTargets, remoteTarget)
+				}
+			}
+		}
+	}
+
+	netOBDs := make([]madmin.NetOBDInfo, len(remoteTargets))
+
+	for index, client := range remoteTargets {
+		if client == nil {
+			continue
+		}
+		var err error
+		netOBDs[index], err = client.NetOBDInfo(ctx)
+
+		addr := client.host.String()
+		reqInfo := (&logger.ReqInfo{}).AppendTags("remotePeer", addr)
+		ctx := logger.SetReqInfo(GlobalContext, reqInfo)
+		logger.LogIf(ctx, err)
+		netOBDs[index].Addr = addr
+		if err != nil {
+			netOBDs[index].Error = err.Error()
+		}
+	}
+	return madmin.ServerNetOBDInfo{
+		Net:  netOBDs,
+		Addr: GetLocalPeer(globalEndpoints),
+	}
+}
+
+// DispatchNetOBDInfo - Net OBD information from other nodes
+func (sys *NotificationSys) DispatchNetOBDInfo(ctx context.Context) []madmin.ServerNetOBDInfo {
+	serverNetOBDs := []madmin.ServerNetOBDInfo{}
+
+	for index, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		serverNetOBD, err := sys.peerClients[index].DispatchNetOBDInfo(ctx)
+		if err != nil {
+			serverNetOBD.Addr = client.host.String()
+			serverNetOBD.Error = err.Error()
+		}
+		serverNetOBDs = append(serverNetOBDs, serverNetOBD)
+	}
+	return serverNetOBDs
+}
+
+// NetOBDParallelInfo - Performs NetOBD tests
+func (sys *NotificationSys) NetOBDParallelInfo(ctx context.Context) madmin.ServerNetOBDInfo {
+	netOBDs := []madmin.NetOBDInfo{}
+	wg := sync.WaitGroup{}
+
+	for index, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+
+		wg.Add(1)
+		go func(index int) {
+			netOBD, err := sys.peerClients[index].NetOBDInfo(ctx)
+			netOBD.Addr = sys.peerClients[index].host.String()
+			if err != nil {
+				netOBD.Error = err.Error()
+			}
+			netOBDs = append(netOBDs, netOBD)
+			wg.Done()
+		}(index)
+	}
+	wg.Wait()
+	return madmin.ServerNetOBDInfo{
+		Net:  netOBDs,
+		Addr: GetLocalPeer(globalEndpoints),
+	}
+
+}
+
+// DriveOBDInfo - Drive OBD information
+func (sys *NotificationSys) DriveOBDInfo(ctx context.Context) []madmin.ServerDrivesOBDInfo {
+	reply := make([]madmin.ServerDrivesOBDInfo, len(sys.peerClients))
+
+	g := errgroup.WithNErrs(len(sys.peerClients))
+	for index, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		index := index
+		g.Go(func() error {
+			var err error
+			reply[index], err = sys.peerClients[index].DriveOBDInfo(ctx)
+			return err
+		}, index)
+	}
+
+	for index, err := range g.Wait() {
+		if err != nil {
+			addr := sys.peerClients[index].host.String()
+			reqInfo := (&logger.ReqInfo{}).AppendTags("remotePeer", addr)
+			ctx := logger.SetReqInfo(GlobalContext, reqInfo)
+			logger.LogIf(ctx, err)
+			reply[index].Addr = addr
+			reply[index].Error = err.Error()
+		}
+	}
+	return reply
+}
+
+// CPUOBDInfo - CPU OBD information
+func (sys *NotificationSys) CPUOBDInfo(ctx context.Context) []madmin.ServerCPUOBDInfo {
+	reply := make([]madmin.ServerCPUOBDInfo, len(sys.peerClients))
+
+	g := errgroup.WithNErrs(len(sys.peerClients))
+	for index, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		index := index
+		g.Go(func() error {
+			var err error
+			reply[index], err = sys.peerClients[index].CPUOBDInfo(ctx)
+			return err
+		}, index)
+	}
+
+	for index, err := range g.Wait() {
+		if err != nil {
+			addr := sys.peerClients[index].host.String()
+			reqInfo := (&logger.ReqInfo{}).AppendTags("remotePeer", addr)
+			ctx := logger.SetReqInfo(GlobalContext, reqInfo)
+			logger.LogIf(ctx, err)
+			reply[index].Addr = addr
+			reply[index].Error = err.Error()
+		}
+	}
+	return reply
+}
+
+// DiskHwOBDInfo - Disk HW OBD information
+func (sys *NotificationSys) DiskHwOBDInfo(ctx context.Context) []madmin.ServerDiskHwOBDInfo {
+	reply := make([]madmin.ServerDiskHwOBDInfo, len(sys.peerClients))
+
+	g := errgroup.WithNErrs(len(sys.peerClients))
+	for index, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		index := index
+		g.Go(func() error {
+			var err error
+			reply[index], err = sys.peerClients[index].DiskHwOBDInfo(ctx)
+			return err
+		}, index)
+	}
+
+	for index, err := range g.Wait() {
+		if err != nil {
+			addr := sys.peerClients[index].host.String()
+			reqInfo := (&logger.ReqInfo{}).AppendTags("remotePeer", addr)
+			ctx := logger.SetReqInfo(GlobalContext, reqInfo)
+			logger.LogIf(ctx, err)
+			reply[index].Addr = addr
+			reply[index].Error = err.Error()
+		}
+	}
+	return reply
+}
+
+// OsOBDInfo - Os OBD information
+func (sys *NotificationSys) OsOBDInfo(ctx context.Context) []madmin.ServerOsOBDInfo {
+	reply := make([]madmin.ServerOsOBDInfo, len(sys.peerClients))
+
+	g := errgroup.WithNErrs(len(sys.peerClients))
+	for index, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		index := index
+		g.Go(func() error {
+			var err error
+			reply[index], err = sys.peerClients[index].OsOBDInfo(ctx)
+			return err
+		}, index)
+	}
+
+	for index, err := range g.Wait() {
+		if err != nil {
+			addr := sys.peerClients[index].host.String()
+			reqInfo := (&logger.ReqInfo{}).AppendTags("remotePeer", addr)
+			ctx := logger.SetReqInfo(GlobalContext, reqInfo)
+			logger.LogIf(ctx, err)
+			reply[index].Addr = addr
+			reply[index].Error = err.Error()
+		}
+	}
+	return reply
+}
+
+// MemOBDInfo - Mem OBD information
+func (sys *NotificationSys) MemOBDInfo(ctx context.Context) []madmin.ServerMemOBDInfo {
+	reply := make([]madmin.ServerMemOBDInfo, len(sys.peerClients))
+
+	g := errgroup.WithNErrs(len(sys.peerClients))
+	for index, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		index := index
+		g.Go(func() error {
+			var err error
+			reply[index], err = sys.peerClients[index].MemOBDInfo(ctx)
+			return err
+		}, index)
+	}
+
+	for index, err := range g.Wait() {
+		if err != nil {
+			addr := sys.peerClients[index].host.String()
+			reqInfo := (&logger.ReqInfo{}).AppendTags("remotePeer", addr)
+			ctx := logger.SetReqInfo(GlobalContext, reqInfo)
+			logger.LogIf(ctx, err)
+			reply[index].Addr = addr
+			reply[index].Error = err.Error()
+		}
+	}
+	return reply
+}
+
+// ProcOBDInfo - Process OBD information
+func (sys *NotificationSys) ProcOBDInfo(ctx context.Context) []madmin.ServerProcOBDInfo {
+	reply := make([]madmin.ServerProcOBDInfo, len(sys.peerClients))
+
+	g := errgroup.WithNErrs(len(sys.peerClients))
+	for index, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		index := index
+		g.Go(func() error {
+			var err error
+			reply[index], err = sys.peerClients[index].ProcOBDInfo(ctx)
+			return err
+		}, index)
+	}
+
+	for index, err := range g.Wait() {
+		if err != nil {
+			addr := sys.peerClients[index].host.String()
+			reqInfo := (&logger.ReqInfo{}).AppendTags("remotePeer", addr)
+			ctx := logger.SetReqInfo(GlobalContext, reqInfo)
+			logger.LogIf(ctx, err)
+			reply[index].Addr = addr
+			reply[index].Error = err.Error()
+		}
+	}
+	return reply
+}
+
+// ServerInfo - calls ServerInfo RPC call on all peers.
+func (sys *NotificationSys) ServerInfo() []madmin.ServerProperties {
+	reply := make([]madmin.ServerProperties, len(sys.peerClients))
+	var wg sync.WaitGroup
+	for i, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(client *peerRESTClient, idx int) {
+			defer wg.Done()
+			info, err := client.ServerInfo()
+			if err != nil {
+				info.Endpoint = client.host.String()
+				info.State = "offline"
+			} else {
+				info.State = "ok"
+			}
+			reply[idx] = info
+		}(client, i)
+	}
+	wg.Wait()
+	return reply
 }
 
 // NewNotificationSys - creates new notification system object.
-func NewNotificationSys(config *serverConfig, endpoints EndpointList) (*NotificationSys, error) {
-	targetList, err := getNotificationTargets(config)
-	if err != nil {
-		return nil, err
-	}
-
-	peerRPCClientMap := makeRemoteRPCClients(endpoints)
-
+func NewNotificationSys(endpoints EndpointZones) *NotificationSys {
 	// bucketRulesMap/bucketRemoteTargetRulesMap are initialized by NotificationSys.Init()
 	return &NotificationSys{
-		targetList:                 targetList,
+		targetList:                 event.NewTargetList(),
+		targetResCh:                make(chan event.TargetIDResult),
 		bucketRulesMap:             make(map[string]event.RulesMap),
 		bucketRemoteTargetRulesMap: make(map[string]map[event.TargetID]event.RulesMap),
-		peerRPCClientMap:           peerRPCClientMap,
-	}, nil
+		peerClients:                newPeerRestClients(endpoints),
+	}
 }
 
 type eventArgs struct {
-	EventName  event.Name
-	BucketName string
-	Object     ObjectInfo
-	ReqParams  map[string]string
-	Host       string
-	Port       string
-	UserAgent  string
+	EventName    event.Name
+	BucketName   string
+	Object       ObjectInfo
+	ReqParams    map[string]string
+	RespElements map[string]string
+	Host         string
+	UserAgent    string
 }
 
 // ToEvent - converts to notification event.
-func (args eventArgs) ToEvent() event.Event {
-	getOriginEndpoint := func() string {
-		host := globalMinioHost
-		if host == "" {
-			// FIXME: Send FQDN or hostname of this machine than sending IP address.
-			host = localIP4.ToSlice()[0]
-		}
-
-		return fmt.Sprintf("%s://%s:%s", getURLScheme(globalIsSSL), host, globalMinioPort)
-	}
-
-	creds := globalServerConfig.GetCredential()
+func (args eventArgs) ToEvent(escape bool) event.Event {
 	eventTime := UTCNow()
 	uniqueID := fmt.Sprintf("%X", eventTime.UnixNano())
 
+	respElements := map[string]string{
+		"x-amz-request-id":        args.RespElements["requestId"],
+		"x-minio-origin-endpoint": globalMinioEndpoint, // MinIO specific custom elements.
+	}
+	// Add deployment as part of
+	if globalDeploymentID != "" {
+		respElements["x-minio-deployment-id"] = globalDeploymentID
+	}
+	if args.RespElements["content-length"] != "" {
+		respElements["content-length"] = args.RespElements["content-length"]
+	}
+	keyName := args.Object.Name
+	if escape {
+		keyName = url.QueryEscape(args.Object.Name)
+	}
 	newEvent := event.Event{
 		EventVersion:      "2.0",
 		EventSource:       "minio:s3",
-		AwsRegion:         globalServerConfig.GetRegion(),
+		AwsRegion:         args.ReqParams["region"],
 		EventTime:         eventTime.Format(event.AMZTimeFormat),
 		EventName:         args.EventName,
-		UserIdentity:      event.Identity{creds.AccessKey},
+		UserIdentity:      event.Identity{PrincipalID: args.ReqParams["accessKey"]},
 		RequestParameters: args.ReqParams,
-		ResponseElements: map[string]string{
-			"x-amz-request-id":        uniqueID,
-			"x-minio-origin-endpoint": getOriginEndpoint(), // Minio specific custom elements.
-		},
+		ResponseElements:  respElements,
 		S3: event.Metadata{
 			SchemaVersion:   "1.0",
 			ConfigurationID: "Config",
 			Bucket: event.Bucket{
 				Name:          args.BucketName,
-				OwnerIdentity: event.Identity{creds.AccessKey},
+				OwnerIdentity: event.Identity{PrincipalID: args.ReqParams["accessKey"]},
 				ARN:           policy.ResourceARNPrefix + args.BucketName,
 			},
 			Object: event.Object{
-				Key:       url.QueryEscape(args.Object.Name),
+				Key:       keyName,
 				VersionID: "1",
 				Sequencer: uniqueID,
 			},
 		},
 		Source: event.Source{
 			Host:      args.Host,
-			Port:      args.Port,
 			UserAgent: args.UserAgent,
 		},
 	}
@@ -543,6 +1314,9 @@ func (args eventArgs) ToEvent() event.Event {
 	if args.EventName != event.ObjectRemovedDelete {
 		newEvent.S3.Object.ETag = args.Object.ETag
 		newEvent.S3.Object.Size = args.Object.Size
+		if args.Object.IsCompressed() {
+			newEvent.S3.Object.Size = args.Object.GetActualSize()
+		}
 		newEvent.S3.Object.ContentType = args.Object.ContentType
 		newEvent.S3.Object.UserMetadata = args.Object.UserDefined
 	}
@@ -551,59 +1325,35 @@ func (args eventArgs) ToEvent() event.Event {
 }
 
 func sendEvent(args eventArgs) {
+	// remove sensitive encryption entries in metadata.
+	switch {
+	case crypto.IsEncrypted(args.Object.UserDefined):
+		if totalObjectSize, err := args.Object.DecryptedSize(); err == nil {
+			args.Object.Size = totalObjectSize
+		}
+	case args.Object.IsCompressed():
+		args.Object.Size = args.Object.GetActualSize()
+	}
+
+	crypto.RemoveSensitiveEntries(args.Object.UserDefined)
+	crypto.RemoveInternalEntries(args.Object.UserDefined)
+
 	// globalNotificationSys is not initialized in gateway mode.
 	if globalNotificationSys == nil {
 		return
 	}
 
-	for _, err := range globalNotificationSys.Send(args) {
-		reqInfo := &logger.ReqInfo{BucketName: args.BucketName, ObjectName: args.Object.Name}
-		reqInfo.AppendTags("EventName", args.EventName.String())
-		reqInfo.AppendTags("targetID", err.ID.Name)
-		ctx := logger.SetReqInfo(context.Background(), reqInfo)
-		logger.LogOnceIf(ctx, err.Err, err.ID)
-	}
-}
-
-func saveConfig(objAPI ObjectLayer, configFile string, data []byte) error {
-	hashReader, err := hash.NewReader(bytes.NewReader(data), int64(len(data)), "", getSHA256Hash(data))
-	if err != nil {
-		return err
+	if globalHTTPListen.HasSubscribers() {
+		globalHTTPListen.Publish(args.ToEvent(false))
 	}
 
-	_, err = objAPI.PutObject(context.Background(), minioMetaBucket, configFile, hashReader, nil)
-	return err
-}
-
-var errConfigNotFound = errors.New("config file not found")
-
-func readConfig(ctx context.Context, objAPI ObjectLayer, configFile string) (*bytes.Buffer, error) {
-	var buffer bytes.Buffer
-	// Read entire content by setting size to -1
-	err := objAPI.GetObject(ctx, minioMetaBucket, configFile, 0, -1, &buffer, "")
-	if err != nil {
-		// Ignore if err is ObjectNotFound or IncompleteBody when bucket is not configured with notification
-		if isErrObjectNotFound(err) || isErrIncompleteBody(err) {
-			return nil, errConfigNotFound
-		}
-
-		logger.GetReqInfo(ctx).AppendTags("configFile", configFile)
-		logger.LogIf(ctx, err)
-		return nil, err
-	}
-
-	// Return NoSuchNotifications on empty content.
-	if buffer.Len() == 0 {
-		return nil, errNoSuchNotifications
-	}
-
-	return &buffer, nil
+	globalNotificationSys.Send(args)
 }
 
 func readNotificationConfig(ctx context.Context, objAPI ObjectLayer, bucketName string) (*event.Config, error) {
 	// Construct path to notification.xml for the given bucket.
 	configFile := path.Join(bucketConfigPrefix, bucketName, bucketNotificationConfig)
-	reader, err := readConfig(ctx, objAPI, configFile)
+	configData, err := readConfig(ctx, objAPI, configFile)
 	if err != nil {
 		if err == errConfigNotFound {
 			err = errNoSuchNotifications
@@ -612,127 +1362,17 @@ func readNotificationConfig(ctx context.Context, objAPI ObjectLayer, bucketName 
 		return nil, err
 	}
 
-	config, err := event.ParseConfig(reader, globalServerConfig.GetRegion(), globalNotificationSys.targetList)
+	config, err := event.ParseConfig(bytes.NewReader(configData), globalServerRegion, globalNotificationSys.targetList)
 	logger.LogIf(ctx, err)
 	return config, err
 }
 
-func saveNotificationConfig(objAPI ObjectLayer, bucketName string, config *event.Config) error {
+func saveNotificationConfig(ctx context.Context, objAPI ObjectLayer, bucketName string, config *event.Config) error {
 	data, err := xml.Marshal(config)
 	if err != nil {
 		return err
 	}
 
 	configFile := path.Join(bucketConfigPrefix, bucketName, bucketNotificationConfig)
-	return saveConfig(objAPI, configFile, data)
-}
-
-// SaveListener - saves HTTP client currently listening for events to listener.json.
-func SaveListener(objAPI ObjectLayer, bucketName string, eventNames []event.Name, pattern string, targetID event.TargetID, addr xnet.Host) error {
-	// listener.json is available/applicable only in DistXL mode.
-	if !globalIsDistXL {
-		return nil
-	}
-
-	ctx := logger.SetReqInfo(context.Background(), &logger.ReqInfo{BucketName: bucketName})
-
-	// Construct path to listener.json for the given bucket.
-	configFile := path.Join(bucketConfigPrefix, bucketName, bucketListenerConfig)
-	transactionConfigFile := configFile + ".transaction"
-
-	// As object layer's GetObject() and PutObject() take respective lock on minioMetaBucket
-	// and configFile, take a transaction lock to avoid data race between readConfig()
-	// and saveConfig().
-	objLock := globalNSMutex.NewNSLock(minioMetaBucket, transactionConfigFile)
-	if err := objLock.GetLock(globalOperationTimeout); err != nil {
-		return err
-	}
-	defer objLock.Unlock()
-
-	reader, err := readConfig(ctx, objAPI, configFile)
-	if err != nil && !IsErrIgnored(err, errDiskNotFound, errConfigNotFound) {
-		return err
-	}
-
-	listenerList := []ListenBucketNotificationArgs{}
-	if reader != nil {
-		if err = json.NewDecoder(reader).Decode(&listenerList); err != nil {
-			logger.LogIf(ctx, err)
-			return err
-		}
-	}
-
-	listenerList = append(listenerList, ListenBucketNotificationArgs{
-		EventNames: eventNames,
-		Pattern:    pattern,
-		TargetID:   targetID,
-		Addr:       addr,
-	})
-
-	data, err := json.Marshal(listenerList)
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return err
-	}
-
-	return saveConfig(objAPI, configFile, data)
-}
-
-// RemoveListener - removes HTTP client currently listening for events from listener.json.
-func RemoveListener(objAPI ObjectLayer, bucketName string, targetID event.TargetID, addr xnet.Host) error {
-	// listener.json is available/applicable only in DistXL mode.
-	if !globalIsDistXL {
-		return nil
-	}
-
-	ctx := logger.SetReqInfo(context.Background(), &logger.ReqInfo{BucketName: bucketName})
-
-	// Construct path to listener.json for the given bucket.
-	configFile := path.Join(bucketConfigPrefix, bucketName, bucketListenerConfig)
-	transactionConfigFile := configFile + ".transaction"
-
-	// As object layer's GetObject() and PutObject() take respective lock on minioMetaBucket
-	// and configFile, take a transaction lock to avoid data race between readConfig()
-	// and saveConfig().
-	objLock := globalNSMutex.NewNSLock(minioMetaBucket, transactionConfigFile)
-	if err := objLock.GetLock(globalOperationTimeout); err != nil {
-		return err
-	}
-	defer objLock.Unlock()
-
-	reader, err := readConfig(ctx, objAPI, configFile)
-	if err != nil && !IsErrIgnored(err, errDiskNotFound, errConfigNotFound) {
-		return err
-	}
-
-	listenerList := []ListenBucketNotificationArgs{}
-	if reader != nil {
-		if err = json.NewDecoder(reader).Decode(&listenerList); err != nil {
-			logger.LogIf(ctx, err)
-			return err
-		}
-	}
-
-	if len(listenerList) == 0 {
-		// Nothing to remove.
-		return nil
-	}
-
-	activeListenerList := []ListenBucketNotificationArgs{}
-	for _, args := range listenerList {
-		if args.TargetID == targetID && args.Addr.Equal(addr) {
-			// Skip if matches
-			continue
-		}
-
-		activeListenerList = append(activeListenerList, args)
-	}
-
-	data, err := json.Marshal(activeListenerList)
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return err
-	}
-
-	return saveConfig(objAPI, configFile, data)
+	return saveConfig(ctx, objAPI, configFile, data)
 }

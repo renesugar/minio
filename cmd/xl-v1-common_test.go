@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2017 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,13 +25,10 @@ import (
 
 // Tests for if parent directory is object
 func TestXLParentDirIsObject(t *testing.T) {
-	rootPath, err := newTestConfig(globalMinioDefaultRegion)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(rootPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	obj, fsDisks, err := prepareXL16()
+	obj, fsDisks, err := prepareXL16(ctx)
 	if err != nil {
 		t.Fatalf("Unable to initialize 'XL' object layer.")
 	}
@@ -44,12 +41,12 @@ func TestXLParentDirIsObject(t *testing.T) {
 	bucketName := "testbucket"
 	objectName := "object"
 
-	if err = obj.MakeBucketWithLocation(context.Background(), bucketName, ""); err != nil {
+	if err = obj.MakeBucketWithLocation(GlobalContext, bucketName, ""); err != nil {
 		t.Fatal(err)
 	}
 	objectContent := "12345"
-	objInfo, err := obj.PutObject(context.Background(), bucketName, objectName,
-		mustGetHashReader(t, bytes.NewReader([]byte(objectContent)), int64(len(objectContent)), "", ""), nil)
+	objInfo, err := obj.PutObject(GlobalContext, bucketName, objectName,
+		mustGetPutObjReader(t, bytes.NewReader([]byte(objectContent)), int64(len(objectContent)), "", ""), ObjectOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +54,8 @@ func TestXLParentDirIsObject(t *testing.T) {
 		t.Fatalf("Unexpected object name returned got %s, expected %s", objInfo.Name, objectName)
 	}
 
-	fs := obj.(*xlObjects)
+	z := obj.(*xlZones)
+	xl := z.zones[0].sets[0]
 	testCases := []struct {
 		parentIsObject bool
 		objectName     string
@@ -78,7 +76,7 @@ func TestXLParentDirIsObject(t *testing.T) {
 		// Should not cause infinite loop.
 		{
 			parentIsObject: false,
-			objectName:     "/",
+			objectName:     SlashSeparator,
 		},
 		{
 			parentIsObject: false,
@@ -92,7 +90,7 @@ func TestXLParentDirIsObject(t *testing.T) {
 	}
 
 	for i, testCase := range testCases {
-		gotValue := fs.parentDirIsObject(context.Background(), bucketName, testCase.objectName)
+		gotValue := xl.parentDirIsObject(GlobalContext, bucketName, testCase.objectName)
 		if testCase.parentIsObject != gotValue {
 			t.Errorf("Test %d: Unexpected value returned got %t, expected %t", i+1, gotValue, testCase.parentIsObject)
 		}

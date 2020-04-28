@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -81,7 +81,9 @@ func writeDataBlocks(ctx context.Context, dst io.Writer, enBlocks [][]byte, data
 		if write < int64(len(block)) {
 			n, err := io.Copy(dst, bytes.NewReader(block[:write]))
 			if err != nil {
-				logger.LogIf(ctx, err)
+				if err != io.ErrClosedPipe {
+					logger.LogIf(ctx, err)
+				}
 				return 0, err
 			}
 			totalWritten += n
@@ -90,7 +92,10 @@ func writeDataBlocks(ctx context.Context, dst io.Writer, enBlocks [][]byte, data
 		// Copy the block.
 		n, err := io.Copy(dst, bytes.NewReader(block))
 		if err != nil {
-			logger.LogIf(ctx, err)
+			// The writer will be closed incase of range queries, which will emit ErrClosedPipe.
+			if err != io.ErrClosedPipe {
+				logger.LogIf(ctx, err)
+			}
 			return 0, err
 		}
 

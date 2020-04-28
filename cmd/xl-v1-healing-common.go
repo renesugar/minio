@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016, 2017 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016-2019 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,10 +18,11 @@ package cmd
 
 import (
 	"context"
-	"path/filepath"
+	"fmt"
 	"time"
 
 	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/madmin"
 )
 
 // commonTime returns a maximally occurring time from a list of time.
@@ -118,8 +119,14 @@ func listOnlineDisks(disks []StorageAPI, partsMetadata []xlMetaV1, errs []error)
 	return onlineDisks, modTime
 }
 
-// Returns one of the latest updated xlMeta files and count of total valid xlMeta(s) updated latest
-func getLatestXLMeta(partsMetadata []xlMetaV1, errs []error) (xlMetaV1, int) {
+// Returns the latest updated xlMeta files and error in case of failure.
+func getLatestXLMeta(ctx context.Context, partsMetadata []xlMetaV1, errs []error) (xlMetaV1, error) {
+
+	// There should be atleast half correct entries, if not return failure
+	if reducedErr := reduceReadQuorumErrs(ctx, errs, objectOpIgnoredErrs, len(partsMetadata)/2); reducedErr != nil {
+		return xlMetaV1{}, reducedErr
+	}
+
 	// List all the file commit ids from parts metadata.
 	modTimes := listObjectModtimes(partsMetadata, errs)
 
@@ -137,8 +144,11 @@ func getLatestXLMeta(partsMetadata []xlMetaV1, errs []error) (xlMetaV1, int) {
 			count++
 		}
 	}
-	// Return one of the latest xlMetaData, and the count of lastest updated xlMeta files
-	return latestXLMeta, count
+	if count < len(partsMetadata)/2 {
+		return xlMetaV1{}, errXLReadQuorum
+	}
+
+	return latestXLMeta, nil
 }
 
 // disksWithAllParts - This function needs to be called with
@@ -148,44 +158,54 @@ func getLatestXLMeta(partsMetadata []xlMetaV1, errs []error) (xlMetaV1, int) {
 //
 // - slice of errors about the state of data files on disk - can have
 //   a not-found error or a hash-mismatch error.
-//
-// - non-nil error if any of the disks failed unexpectedly (i.e. error
-//   other than file not found and not a checksum error).
 func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetadata []xlMetaV1, errs []error, bucket,
-	object string) ([]StorageAPI, []error, error) {
-
+	object string, scanMode madmin.HealScanMode) ([]StorageAPI, []error) {
 	availableDisks := make([]StorageAPI, len(onlineDisks))
-	buffer := []byte{}
 	dataErrs := make([]error, len(onlineDisks))
 
 	for i, onlineDisk := range onlineDisks {
 		if onlineDisk == nil {
+			dataErrs[i] = errs[i]
 			continue
 		}
 
-		// disk has a valid xl.json but may not have all the
-		// parts. This is considered an outdated disk, since
-		// it needs healing too.
-		for _, part := range partsMetadata[i].Parts {
-			partPath := filepath.Join(object, part.Name)
-			checksumInfo := partsMetadata[i].Erasure.GetChecksumInfo(part.Name)
-			verifier := NewBitrotVerifier(checksumInfo.Algorithm, checksumInfo.Hash)
+		switch scanMode {
+		case madmin.HealDeepScan:
+			erasureInfo := partsMetadata[i].Erasure
+			erasure, err := NewErasure(ctx, erasureInfo.DataBlocks, erasureInfo.ParityBlocks, erasureInfo.BlockSize)
+			if err != nil {
+				dataErrs[i] = err
+				continue
+			}
 
-			// verification happens even if a 0-length
-			// buffer is passed
-			_, hErr := onlineDisk.ReadFile(bucket, partPath, 0, buffer, verifier)
-
-			_, isCorrupt := hErr.(hashMismatchError)
-			switch {
-			case isCorrupt:
-				fallthrough
-			case hErr == errFileNotFound, hErr == errVolumeNotFound:
-				dataErrs[i] = hErr
-				break
-			case hErr != nil:
-				logger.LogIf(ctx, hErr)
-				// abort on unhandled errors
-				return nil, nil, hErr
+			// disk has a valid xl.json but may not have all the
+			// parts. This is considered an outdated disk, since
+			// it needs healing too.
+			for _, part := range partsMetadata[i].Parts {
+				checksumInfo := erasureInfo.GetChecksumInfo(part.Number)
+				partPath := pathJoin(object, fmt.Sprintf("part.%d", part.Number))
+				err = onlineDisk.VerifyFile(bucket, partPath, erasure.ShardFileSize(part.Size), checksumInfo.Algorithm, checksumInfo.Hash, erasure.ShardSize())
+				if err != nil {
+					if !IsErr(err, []error{
+						errFileNotFound,
+						errVolumeNotFound,
+						errFileCorrupt,
+					}...) {
+						logger.GetReqInfo(ctx).AppendTags("disk", onlineDisk.String())
+						logger.LogIf(ctx, err)
+					}
+					dataErrs[i] = err
+					break
+				}
+			}
+		case madmin.HealNormalScan:
+			for _, part := range partsMetadata[i].Parts {
+				partPath := pathJoin(object, fmt.Sprintf("part.%d", part.Number))
+				_, err := onlineDisk.StatFile(bucket, partPath)
+				if err != nil {
+					dataErrs[i] = err
+					break
+				}
 			}
 		}
 
@@ -195,5 +215,5 @@ func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetad
 		}
 	}
 
-	return availableDisks, dataErrs, nil
+	return availableDisks, dataErrs
 }

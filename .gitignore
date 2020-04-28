@@ -9,7 +9,6 @@ site/
 /.idea/
 /Minio.iml
 **/access.log
-build/
 vendor/**/*.js
 vendor/**/*.json
 release
@@ -22,3 +21,4 @@ parts/
 prime/
 stage/
 .sia_temp/
+config.json

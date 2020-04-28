@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,16 +19,9 @@ package logger
 import (
 	"fmt"
 	"regexp"
+	"runtime"
 
-	"github.com/fatih/color"
-)
-
-// Global colors.
-var (
-	colorBold    = color.New(color.Bold).SprintFunc()
-	colorFgRed   = color.New(color.FgRed).SprintfFunc()
-	colorBgRed   = color.New(color.BgRed).SprintfFunc()
-	colorFgWhite = color.New(color.FgWhite).SprintfFunc()
+	"github.com/minio/minio/pkg/color"
 )
 
 var ansiRE = regexp.MustCompile("(\x1b[^m]*m)")
@@ -40,26 +33,29 @@ func ansiEscape(format string, args ...interface{}) {
 }
 
 func ansiMoveRight(n int) {
-	ansiEscape("[%dC", n)
+	if runtime.GOOS == "windows" {
+		return
+	}
+	if color.IsTerminal() {
+		ansiEscape("[%dC", n)
+	}
 }
 
 func ansiSaveAttributes() {
-	ansiEscape("7")
+	if runtime.GOOS == "windows" {
+		return
+	}
+	if color.IsTerminal() {
+		ansiEscape("7")
+	}
 }
 
 func ansiRestoreAttributes() {
-	ansiEscape("8")
-}
-
-func uniqueEntries(paths []string) []string {
-	found := map[string]bool{}
-	unqiue := []string{}
-
-	for v := range paths {
-		if _, ok := found[paths[v]]; !ok {
-			found[paths[v]] = true
-			unqiue = append(unqiue, paths[v])
-		}
+	if runtime.GOOS == "windows" {
+		return
 	}
-	return unqiue
+	if color.IsTerminal() {
+		ansiEscape("8")
+	}
+
 }

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016, 2017, 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016, 2017, 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -29,10 +28,9 @@ import (
 	"strings"
 	"time"
 
+	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/minio/cmd/logger"
 	mioutil "github.com/minio/minio/pkg/ioutil"
-
-	"github.com/minio/minio/pkg/hash"
 )
 
 // Returns EXPORT/.minio.sys/multipart/SHA256/UPLOADID
@@ -46,21 +44,25 @@ func (fs *FSObjects) getMultipartSHADir(bucket, object string) string {
 }
 
 // Returns partNumber.etag
-func (fs *FSObjects) encodePartFile(partNumber int, etag string) string {
-	return fmt.Sprintf("%.5d.%s", partNumber, etag)
+func (fs *FSObjects) encodePartFile(partNumber int, etag string, actualSize int64) string {
+	return fmt.Sprintf("%.5d.%s.%d", partNumber, etag, actualSize)
 }
 
 // Returns partNumber and etag
-func (fs *FSObjects) decodePartFile(name string) (partNumber int, etag string, err error) {
+func (fs *FSObjects) decodePartFile(name string) (partNumber int, etag string, actualSize int64, err error) {
 	result := strings.Split(name, ".")
-	if len(result) != 2 {
-		return 0, "", errUnexpected
+	if len(result) != 3 {
+		return 0, "", 0, errUnexpected
 	}
 	partNumber, err = strconv.Atoi(result[0])
 	if err != nil {
-		return 0, "", errUnexpected
+		return 0, "", 0, errUnexpected
 	}
-	return partNumber, result[1], nil
+	actualSize, err = strconv.ParseInt(result[2], 10, 64)
+	if err != nil {
+		return 0, "", 0, errUnexpected
+	}
+	return partNumber, result[1], actualSize, nil
 }
 
 // Appends parts to an appendFile sequentially.
@@ -95,11 +97,10 @@ func (fs *FSObjects) backgroundAppend(ctx context.Context, bucket, object, uploa
 		if entry == fs.metaJSONFile {
 			continue
 		}
-		partNumber, etag, err := fs.decodePartFile(entry)
+		partNumber, etag, actualSize, err := fs.decodePartFile(entry)
 		if err != nil {
-			logger.GetReqInfo(ctx).AppendTags("entry", entry)
-			logger.LogIf(ctx, err)
-			return
+			// Skip part files whose name don't match expected format. These could be backend filesystem specific files.
+			continue
 		}
 		if partNumber < nextPartNumber {
 			// Part already appended.
@@ -119,7 +120,7 @@ func (fs *FSObjects) backgroundAppend(ctx context.Context, bucket, object, uploa
 			return
 		}
 
-		file.parts = append(file.parts, PartInfo{PartNumber: nextPartNumber, ETag: etag})
+		file.parts = append(file.parts, PartInfo{PartNumber: partNumber, ETag: etag, ActualSize: actualSize})
 		nextPartNumber++
 	}
 }
@@ -152,7 +153,7 @@ func (fs *FSObjects) ListMultipartUploads(ctx context.Context, bucket, object, k
 		return result, toObjectErr(err)
 	}
 
-	// S3 spec says uploaIDs should be sorted based on initiated time. ModTime of fs.json
+	// S3 spec says uploadIDs should be sorted based on initiated time. ModTime of fs.json
 	// is the creation time of the uploadID, hence we will use that.
 	var uploads []MultipartInfo
 	for _, uploadID := range uploadIDs {
@@ -163,7 +164,7 @@ func (fs *FSObjects) ListMultipartUploads(ctx context.Context, bucket, object, k
 		}
 		uploads = append(uploads, MultipartInfo{
 			Object:    object,
-			UploadID:  strings.TrimSuffix(uploadID, slashSeparator),
+			UploadID:  strings.TrimSuffix(uploadID, SlashSeparator),
 			Initiated: fi.ModTime(),
 		})
 	}
@@ -209,7 +210,7 @@ func (fs *FSObjects) ListMultipartUploads(ctx context.Context, bucket, object, k
 // subsequent request each UUID is unique.
 //
 // Implements S3 compatible initiate multipart API.
-func (fs *FSObjects) NewMultipartUpload(ctx context.Context, bucket, object string, meta map[string]string) (string, error) {
+func (fs *FSObjects) NewMultipartUpload(ctx context.Context, bucket, object string, opts ObjectOptions) (string, error) {
 	if err := checkNewMultipartArgs(ctx, bucket, object, fs); err != nil {
 		return "", toObjectErr(err, bucket)
 	}
@@ -229,7 +230,7 @@ func (fs *FSObjects) NewMultipartUpload(ctx context.Context, bucket, object stri
 
 	// Initialize fs.json values.
 	fsMeta := newFSMetaV1()
-	fsMeta.Meta = meta
+	fsMeta.Meta = opts.UserDefined
 
 	fsMetaBytes, err := json.Marshal(fsMeta)
 	if err != nil {
@@ -249,29 +250,13 @@ func (fs *FSObjects) NewMultipartUpload(ctx context.Context, bucket, object stri
 // object. Internally incoming data is written to '.minio.sys/tmp' location
 // and safely renamed to '.minio.sys/multipart' for reach parts.
 func (fs *FSObjects) CopyObjectPart(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject, uploadID string, partID int,
-	startOffset int64, length int64, srcInfo ObjectInfo) (pi PartInfo, e error) {
+	startOffset int64, length int64, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (pi PartInfo, e error) {
 
 	if err := checkNewMultipartArgs(ctx, srcBucket, srcObject, fs); err != nil {
 		return pi, toObjectErr(err)
 	}
 
-	// Initialize pipe.
-	go func() {
-		if gerr := fs.GetObject(ctx, srcBucket, srcObject, startOffset, length, srcInfo.Writer, srcInfo.ETag); gerr != nil {
-			if gerr = srcInfo.Writer.Close(); gerr != nil {
-				logger.LogIf(ctx, gerr)
-				return
-			}
-			return
-		}
-		// Close writer explicitly signalling we wrote all data.
-		if gerr := srcInfo.Writer.Close(); gerr != nil {
-			logger.LogIf(ctx, gerr)
-			return
-		}
-	}()
-
-	partInfo, err := fs.PutObjectPart(ctx, dstBucket, dstObject, uploadID, partID, srcInfo.Reader)
+	partInfo, err := fs.PutObjectPart(ctx, dstBucket, dstObject, uploadID, partID, srcInfo.PutObjReader, dstOpts)
 	if err != nil {
 		return pi, toObjectErr(err, dstBucket, dstObject)
 	}
@@ -283,7 +268,8 @@ func (fs *FSObjects) CopyObjectPart(ctx context.Context, srcBucket, srcObject, d
 // an ongoing multipart transaction. Internally incoming data is
 // written to '.minio.sys/tmp' location and safely renamed to
 // '.minio.sys/multipart' for reach parts.
-func (fs *FSObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, data *hash.Reader) (pi PartInfo, e error) {
+func (fs *FSObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, r *PutObjReader, opts ObjectOptions) (pi PartInfo, e error) {
+	data := r.Reader
 	if err := checkPutObjectPartArgs(ctx, bucket, object, fs); err != nil {
 		return pi, toObjectErr(err, bucket)
 	}
@@ -292,9 +278,9 @@ func (fs *FSObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID
 		return pi, toObjectErr(err, bucket)
 	}
 
-	// Validate input data size and it can never be less than zero.
-	if data.Size() < 0 {
-		logger.LogIf(ctx, errInvalidArgument)
+	// Validate input data size and it can never be less than -1.
+	if data.Size() < -1 {
+		logger.LogIf(ctx, errInvalidArgument, logger.Application)
 		return pi, toObjectErr(errInvalidArgument)
 	}
 
@@ -333,14 +319,19 @@ func (fs *FSObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID
 	// PutObjectPart succeeds then there would be nothing to
 	// delete in which case we just ignore the error.
 	defer fsRemoveFile(ctx, tmpPartPath)
+	etag := r.MD5CurrentHexString()
 
-	etag := hex.EncodeToString(data.MD5Current())
 	if etag == "" {
 		etag = GenETag()
 	}
-	partPath := pathJoin(uploadIDDir, fs.encodePartFile(partID, etag))
 
-	if err = fsRenameFile(ctx, tmpPartPath, partPath); err != nil {
+	partPath := pathJoin(uploadIDDir, fs.encodePartFile(partID, etag, data.ActualSize()))
+
+	// Make sure not to create parent directories if they don't exist - the upload might have been aborted.
+	if err = fsSimpleRenameFile(ctx, tmpPartPath, partPath); err != nil {
+		if err == errFileNotFound || err == errFileAccessDenied {
+			return pi, InvalidUploadID{UploadID: uploadID}
+		}
 		return pi, toObjectErr(err, minioMetaMultipartBucket, partPath)
 	}
 
@@ -355,6 +346,7 @@ func (fs *FSObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID
 		LastModified: fi.ModTime(),
 		ETag:         etag,
 		Size:         fi.Size(),
+		ActualSize:   data.ActualSize(),
 	}, nil
 }
 
@@ -365,7 +357,7 @@ func (fs *FSObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID
 // Implements S3 compatible ListObjectParts API. The resulting
 // ListPartsInfo structure is unmarshalled directly into XML and
 // replied back to the client.
-func (fs *FSObjects) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker, maxParts int) (result ListPartsInfo, e error) {
+func (fs *FSObjects) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker, maxParts int, opts ObjectOptions) (result ListPartsInfo, e error) {
 	if err := checkListPartsArgs(ctx, bucket, object, fs); err != nil {
 		return result, toObjectErr(err)
 	}
@@ -381,8 +373,7 @@ func (fs *FSObjects) ListObjectParts(ctx context.Context, bucket, object, upload
 	}
 
 	uploadIDDir := fs.getUploadIDDir(bucket, object, uploadID)
-	_, err := fsStatFile(ctx, pathJoin(uploadIDDir, fs.metaJSONFile))
-	if err != nil {
+	if _, err := fsStatFile(ctx, pathJoin(uploadIDDir, fs.metaJSONFile)); err != nil {
 		if err == errFileNotFound || err == errFileAccessDenied {
 			return result, InvalidUploadID{UploadID: uploadID}
 		}
@@ -400,21 +391,21 @@ func (fs *FSObjects) ListObjectParts(ctx context.Context, bucket, object, upload
 		if entry == fs.metaJSONFile {
 			continue
 		}
-		partNumber, etag1, derr := fs.decodePartFile(entry)
+		partNumber, etag1, _, derr := fs.decodePartFile(entry)
 		if derr != nil {
-			logger.LogIf(ctx, derr)
-			return result, toObjectErr(derr)
+			// Skip part files whose name don't match expected format. These could be backend filesystem specific files.
+			continue
 		}
 		etag2, ok := partsMap[partNumber]
 		if !ok {
 			partsMap[partNumber] = etag1
 			continue
 		}
-		stat1, serr := fsStatFile(ctx, pathJoin(uploadIDDir, fs.encodePartFile(partNumber, etag1)))
+		stat1, serr := fsStatFile(ctx, pathJoin(uploadIDDir, getPartFile(entries, partNumber, etag1)))
 		if serr != nil {
 			return result, toObjectErr(serr)
 		}
-		stat2, serr := fsStatFile(ctx, pathJoin(uploadIDDir, fs.encodePartFile(partNumber, etag2)))
+		stat2, serr := fsStatFile(ctx, pathJoin(uploadIDDir, getPartFile(entries, partNumber, etag2)))
 		if serr != nil {
 			return result, toObjectErr(serr)
 		}
@@ -424,8 +415,19 @@ func (fs *FSObjects) ListObjectParts(ctx context.Context, bucket, object, upload
 	}
 
 	var parts []PartInfo
+	var actualSize int64
 	for partNumber, etag := range partsMap {
-		parts = append(parts, PartInfo{PartNumber: partNumber, ETag: etag})
+		partFile := getPartFile(entries, partNumber, etag)
+		if partFile == "" {
+			return result, InvalidPart{}
+		}
+		// Read the actualSize from the pathFileName.
+		subParts := strings.Split(partFile, ".")
+		actualSize, err = strconv.ParseInt(subParts[len(subParts)-1], 10, 64)
+		if err != nil {
+			return result, InvalidPart{}
+		}
+		parts = append(parts, PartInfo{PartNumber: partNumber, ETag: etag, ActualSize: actualSize})
 	}
 	sort.Slice(parts, func(i int, j int) bool {
 		return parts[i].PartNumber < parts[j].PartNumber
@@ -455,12 +457,13 @@ func (fs *FSObjects) ListObjectParts(ctx context.Context, bucket, object, upload
 	}
 	for i, part := range result.Parts {
 		var stat os.FileInfo
-		stat, err = fsStatFile(ctx, pathJoin(uploadIDDir, fs.encodePartFile(part.PartNumber, part.ETag)))
+		stat, err = fsStatFile(ctx, pathJoin(uploadIDDir,
+			fs.encodePartFile(part.PartNumber, part.ETag, part.ActualSize)))
 		if err != nil {
 			return result, toObjectErr(err)
 		}
 		result.Parts[i].LastModified = stat.ModTime()
-		result.Parts[i].Size = stat.Size()
+		result.Parts[i].Size = part.ActualSize
 	}
 
 	fsMetaBytes, err := ioutil.ReadFile(pathJoin(uploadIDDir, fs.metaJSONFile))
@@ -469,7 +472,13 @@ func (fs *FSObjects) ListObjectParts(ctx context.Context, bucket, object, upload
 		return result, err
 	}
 
-	result.UserDefined = parseFSMetaMap(fsMetaBytes)
+	var fsMeta fsMetaV1
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	if err = json.Unmarshal(fsMetaBytes, &fsMeta); err != nil {
+		return result, err
+	}
+
+	result.UserDefined = fsMeta.Meta
 	return result, nil
 }
 
@@ -479,19 +488,23 @@ func (fs *FSObjects) ListObjectParts(ctx context.Context, bucket, object, upload
 // md5sums of all the parts.
 //
 // Implements S3 compatible Complete multipart API.
-func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string, object string, uploadID string, parts []CompletePart) (oi ObjectInfo, e error) {
+func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string, object string, uploadID string, parts []CompletePart, opts ObjectOptions) (oi ObjectInfo, e error) {
+
+	var actualSize int64
+
 	if err := checkCompleteMultipartArgs(ctx, bucket, object, fs); err != nil {
 		return oi, toObjectErr(err)
 	}
 
 	// Check if an object is present as one of the parent dir.
 	if fs.parentDirIsObject(ctx, bucket, pathutil.Dir(object)) {
-		return oi, toObjectErr(errFileAccessDenied, bucket, object)
+		return oi, toObjectErr(errFileParentIsFile, bucket, object)
 	}
 
 	if _, err := fs.statBucketDir(ctx, bucket); err != nil {
 		return oi, toObjectErr(err, bucket)
 	}
+	defer ObjectPathUpdated(pathutil.Join(bucket, object))
 
 	uploadIDDir := fs.getUploadIDDir(bucket, object, uploadID)
 	// Just check if the uploadID exists to avoid copy if it doesn't.
@@ -504,21 +517,51 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 	}
 
 	// Calculate s3 compatible md5sum for complete multipart.
-	s3MD5, err := getCompleteMultipartMD5(ctx, parts)
-	if err != nil {
-		return oi, err
-	}
+	s3MD5 := getCompleteMultipartMD5(parts)
 
 	partSize := int64(-1) // Used later to ensure that all parts sizes are same.
 
 	fsMeta := fsMetaV1{}
 
 	// Allocate parts similar to incoming slice.
-	fsMeta.Parts = make([]objectPartInfo, len(parts))
+	fsMeta.Parts = make([]ObjectPartInfo, len(parts))
 
+	entries, err := readDir(uploadIDDir)
+	if err != nil {
+		logger.GetReqInfo(ctx).AppendTags("uploadIDDir", uploadIDDir)
+		logger.LogIf(ctx, err)
+		return oi, err
+	}
+
+	// ensure that part ETag is canonicalized to strip off extraneous quotes
+	for i := range parts {
+		parts[i].ETag = canonicalizeETag(parts[i].ETag)
+	}
+
+	// Save consolidated actual size.
+	var objectActualSize int64
 	// Validate all parts and then commit to disk.
 	for i, part := range parts {
-		partPath := pathJoin(uploadIDDir, fs.encodePartFile(part.PartNumber, part.ETag))
+		partFile := getPartFile(entries, part.PartNumber, part.ETag)
+		if partFile == "" {
+			return oi, InvalidPart{
+				PartNumber: part.PartNumber,
+				GotETag:    part.ETag,
+			}
+		}
+
+		// Read the actualSize from the pathFileName.
+		subParts := strings.Split(partFile, ".")
+		actualSize, err = strconv.ParseInt(subParts[len(subParts)-1], 10, 64)
+		if err != nil {
+			return oi, InvalidPart{
+				PartNumber: part.PartNumber,
+				GotETag:    part.ETag,
+			}
+		}
+
+		partPath := pathJoin(uploadIDDir, partFile)
+
 		var fi os.FileInfo
 		fi, err = fsStatFile(ctx, partPath)
 		if err != nil {
@@ -528,40 +571,29 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 			return oi, err
 		}
 		if partSize == -1 {
-			partSize = fi.Size()
+			partSize = actualSize
 		}
 
-		fsMeta.Parts[i] = objectPartInfo{
-			Number: part.PartNumber,
-			ETag:   part.ETag,
-			Size:   fi.Size(),
+		fsMeta.Parts[i] = ObjectPartInfo{
+			Number:     part.PartNumber,
+			Size:       fi.Size(),
+			ActualSize: actualSize,
 		}
+
+		// Consolidate the actual size.
+		objectActualSize += actualSize
 
 		if i == len(parts)-1 {
 			break
 		}
 
 		// All parts except the last part has to be atleast 5MB.
-		if !isMinAllowedPartSize(fi.Size()) {
-			err = PartTooSmall{
+		if !isMinAllowedPartSize(actualSize) {
+			return oi, PartTooSmall{
 				PartNumber: part.PartNumber,
-				PartSize:   fi.Size(),
+				PartSize:   actualSize,
 				PartETag:   part.ETag,
 			}
-			logger.LogIf(ctx, err)
-			return oi, err
-		}
-
-		// TODO: Make necessary changes in future as explained in the below comment.
-		// All parts except the last part has to be of same size. We are introducing this
-		// check to see if any clients break. If clients do not break then we can optimize
-		// multipart PutObjectPart by writing the part at the right offset using pwrite()
-		// so that we don't need to do background append at all. i.e by the time we get
-		// CompleteMultipartUpload we already have the full file available which can be
-		// renamed to the main name-space.
-		if partSize != fi.Size() {
-			logger.LogIf(ctx, PartsSizeUnequal{})
-			return oi, PartsSizeUnequal{}
 		}
 	}
 
@@ -601,11 +633,12 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 	}
 
 	if appendFallback {
-		fsRemoveFile(ctx, file.filePath)
+		if file != nil {
+			fsRemoveFile(ctx, file.filePath)
+		}
 		for _, part := range parts {
-			partPath := pathJoin(uploadIDDir, fs.encodePartFile(part.PartNumber, part.ETag))
-			err = mioutil.AppendFile(appendFilePath, partPath)
-			if err != nil {
+			partPath := getPartFile(entries, part.PartNumber, part.ETag)
+			if err = mioutil.AppendFile(appendFilePath, pathJoin(uploadIDDir, partPath)); err != nil {
 				logger.LogIf(ctx, err)
 				return oi, toObjectErr(err)
 			}
@@ -613,7 +646,7 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 	}
 
 	// Hold write lock on the object.
-	destLock := fs.nsMutex.NewNSLock(bucket, object)
+	destLock := fs.NewNSLock(ctx, bucket, object)
 	if err = destLock.GetLock(globalObjectTimeout); err != nil {
 		return oi, err
 	}
@@ -642,16 +675,11 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 		fsMeta.Meta = make(map[string]string)
 	}
 	fsMeta.Meta["etag"] = s3MD5
+	// Save consolidated actual size.
+	fsMeta.Meta[ReservedMetadataPrefix+"actual-size"] = strconv.FormatInt(objectActualSize, 10)
 	if _, err = fsMeta.WriteTo(metaFile); err != nil {
 		logger.LogIf(ctx, err)
 		return oi, toObjectErr(err, bucket, object)
-	}
-
-	// Deny if WORM is enabled
-	if globalWORMEnabled {
-		if _, err = fsStatFile(ctx, pathJoin(fs.fsPath, bucket, object)); err == nil {
-			return ObjectInfo{}, ObjectAlreadyExists{Bucket: bucket, Object: object}
-		}
 	}
 
 	err = fsRenameFile(ctx, appendFilePath, pathJoin(fs.fsPath, bucket, object))
@@ -660,6 +688,8 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 		return oi, toObjectErr(err, bucket, object)
 	}
 	fsRemoveAll(ctx, uploadIDDir)
+	// It is safe to ignore any directory not empty error (in case there were multiple uploadIDs on the same object)
+	fsRemoveDir(ctx, fs.getMultipartSHADir(bucket, object))
 	fi, err := fsStatFile(ctx, pathJoin(fs.fsPath, bucket, object))
 	if err != nil {
 		return oi, toObjectErr(err, bucket, object)
@@ -690,6 +720,11 @@ func (fs *FSObjects) AbortMultipartUpload(ctx context.Context, bucket, object, u
 	}
 
 	fs.appendFileMapMu.Lock()
+	// Remove file in tmp folder
+	file := fs.appendFileMap[uploadID]
+	if file != nil {
+		fsRemoveFile(ctx, file.filePath)
+	}
 	delete(fs.appendFileMap, uploadID)
 	fs.appendFileMapMu.Unlock()
 
@@ -702,9 +737,13 @@ func (fs *FSObjects) AbortMultipartUpload(ctx context.Context, bucket, object, u
 		}
 		return toObjectErr(err, bucket, object)
 	}
+
 	// Ignore the error returned as Windows fails to remove directory if a file in it
 	// is Open()ed by the backgroundAppend()
 	fsRemoveAll(ctx, uploadIDDir)
+
+	// It is safe to ignore any directory not empty error (in case there were multiple uploadIDs on the same object)
+	fsRemoveDir(ctx, fs.getMultipartSHADir(bucket, object))
 
 	return nil
 }
@@ -712,13 +751,13 @@ func (fs *FSObjects) AbortMultipartUpload(ctx context.Context, bucket, object, u
 // Removes multipart uploads if any older than `expiry` duration
 // on all buckets for every `cleanupInterval`, this function is
 // blocking and should be run in a go-routine.
-func (fs *FSObjects) cleanupStaleMultipartUploads(ctx context.Context, cleanupInterval, expiry time.Duration, doneCh chan struct{}) {
+func (fs *FSObjects) cleanupStaleMultipartUploads(ctx context.Context, cleanupInterval, expiry time.Duration) {
 	ticker := time.NewTicker(cleanupInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-doneCh:
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			now := time.Now()
@@ -731,6 +770,12 @@ func (fs *FSObjects) cleanupStaleMultipartUploads(ctx context.Context, cleanupIn
 				if err != nil {
 					continue
 				}
+
+				// Remove the trailing slash separator
+				for i := range uploadIDs {
+					uploadIDs[i] = strings.TrimSuffix(uploadIDs[i], SlashSeparator)
+				}
+
 				for _, uploadID := range uploadIDs {
 					fi, err := fsStatDir(ctx, pathJoin(fs.fsPath, minioMetaMultipartBucket, entry, uploadID))
 					if err != nil {
@@ -738,6 +783,18 @@ func (fs *FSObjects) cleanupStaleMultipartUploads(ctx context.Context, cleanupIn
 					}
 					if now.Sub(fi.ModTime()) > expiry {
 						fsRemoveAll(ctx, pathJoin(fs.fsPath, minioMetaMultipartBucket, entry, uploadID))
+						// It is safe to ignore any directory not empty error (in case there were multiple uploadIDs on the same object)
+						fsRemoveDir(ctx, pathJoin(fs.fsPath, minioMetaMultipartBucket, entry))
+
+						// Remove uploadID from the append file map and its corresponding temporary file
+						fs.appendFileMapMu.Lock()
+						bgAppend, ok := fs.appendFileMap[uploadID]
+						if ok {
+							err := fsRemoveFile(ctx, bgAppend.filePath)
+							logger.LogIf(ctx, err)
+							delete(fs.appendFileMap, uploadID)
+						}
+						fs.appendFileMapMu.Unlock()
 					}
 				}
 			}

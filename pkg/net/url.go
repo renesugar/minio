@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,8 +19,11 @@ package net
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"net/url"
 	"path"
+	"strings"
 )
 
 // URL - improved JSON friendly url.URL.
@@ -78,6 +81,21 @@ func (u *URL) UnmarshalJSON(data []byte) (err error) {
 	return nil
 }
 
+// ParseHTTPURL - parses a string into HTTP URL, string is
+// expected to be of form http:// or https://
+func ParseHTTPURL(s string) (u *URL, err error) {
+	u, err = ParseURL(s)
+	if err != nil {
+		return nil, err
+	}
+	switch u.Scheme {
+	default:
+		return nil, fmt.Errorf("unexpected scheme found %s", u.Scheme)
+	case "http", "https":
+		return u, nil
+	}
+}
+
 // ParseURL - parses string into URL.
 func ParseURL(s string) (u *URL, err error) {
 	var uu *url.URL
@@ -85,12 +103,23 @@ func ParseURL(s string) (u *URL, err error) {
 		return nil, err
 	}
 
-	if uu.Host == "" {
+	if uu.Hostname() == "" {
 		if uu.Scheme != "" {
 			return nil, errors.New("scheme appears with empty host")
 		}
-	} else if _, err = ParseHost(uu.Host); err != nil {
-		return nil, err
+	} else {
+		portStr := uu.Port()
+		if portStr == "" {
+			switch uu.Scheme {
+			case "http":
+				portStr = "80"
+			case "https":
+				portStr = "443"
+			}
+		}
+		if _, err = ParseHost(net.JoinHostPort(uu.Hostname(), portStr)); err != nil {
+			return nil, err
+		}
 	}
 
 	// Clean path in the URL.
@@ -100,7 +129,52 @@ func ParseURL(s string) (u *URL, err error) {
 		uu.Path = path.Clean(uu.Path)
 	}
 
+	// path.Clean removes the trailing '/' and converts '//' to '/'.
+	if strings.HasSuffix(s, "/") && !strings.HasSuffix(uu.Path, "/") {
+		uu.Path += "/"
+	}
+
 	v := URL(*uu)
 	u = &v
 	return u, nil
+}
+
+// IsNetworkOrHostDown - if there was a network error or if the host is down.
+func IsNetworkOrHostDown(err error) bool {
+	if err == nil {
+		return false
+	}
+	// We need to figure if the error either a timeout
+	// or a non-temporary error.
+	e, ok := err.(net.Error)
+	if ok {
+		urlErr, ok := e.(*url.Error)
+		if ok {
+			switch urlErr.Err.(type) {
+			case *net.DNSError, *net.OpError, net.UnknownNetworkError:
+				return true
+			}
+		}
+		if e.Timeout() {
+			return true
+		}
+	}
+	ok = false
+	// Fallback to other mechanisms.
+	if strings.Contains(err.Error(), "Connection closed by foreign host") {
+		ok = true
+	} else if strings.Contains(err.Error(), "TLS handshake timeout") {
+		// If error is - tlsHandshakeTimeoutError.
+		ok = true
+	} else if strings.Contains(err.Error(), "i/o timeout") {
+		// If error is - tcp timeoutError.
+		ok = true
+	} else if strings.Contains(err.Error(), "connection timed out") {
+		// If err is a net.Dial timeout.
+		ok = true
+	} else if strings.Contains(strings.ToLower(err.Error()), "503 service unavailable") {
+		// Denial errors
+		ok = true
+	}
+	return ok
 }

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,17 +18,34 @@ import configureStore from "redux-mock-store"
 import thunk from "redux-thunk"
 import * as actionsObjects from "../actions"
 import * as alertActions from "../../alert/actions"
-import { minioBrowserPrefix } from "../../constants"
+import {
+  minioBrowserPrefix,
+  SORT_BY_NAME,
+  SORT_ORDER_ASC,
+  SORT_BY_LAST_MODIFIED,
+  SORT_ORDER_DESC
+} from "../../constants"
+import history from "../../history"
 
 jest.mock("../../web", () => ({
-  LoggedIn: jest.fn(() => true).mockReturnValueOnce(false),
-  ListObjects: jest.fn(() => {
-    return Promise.resolve({
-      objects: [{ name: "test1" }, { name: "test2" }],
-      istruncated: false,
-      nextmarker: "test2",
-      writable: false
-    })
+  LoggedIn: jest
+    .fn(() => true)
+    .mockReturnValueOnce(true)
+    .mockReturnValueOnce(false)
+    .mockReturnValueOnce(true)
+    .mockReturnValueOnce(true)
+    .mockReturnValueOnce(false),
+  ListObjects: jest.fn(({ bucketName }) => {
+    if (bucketName === "test-deny") {
+      return Promise.reject({
+        message: "listobjects is denied"
+      })
+    } else {
+      return Promise.resolve({
+        objects: [{ name: "test1" }, { name: "test2" }],
+        writable: false
+      })
+    }
   }),
   RemoveObject: jest.fn(({ bucketName, objects }) => {
     if (!bucketName) {
@@ -64,17 +81,11 @@ describe("Objects actions", () => {
     const expectedActions = [
       {
         type: "objects/SET_LIST",
-        objects: [{ name: "test1" }, { name: "test2" }],
-        isTruncated: false,
-        marker: "test2"
+        objects: [{ name: "test1" }, { name: "test2" }]
       }
     ]
     store.dispatch(
-      actionsObjects.setList(
-        [{ name: "test1" }, { name: "test2" }],
-        "test2",
-        false
-      )
+      actionsObjects.setList([{ name: "test1" }, { name: "test2" }])
     )
     const actions = store.getActions()
     expect(actions).toEqual(expectedActions)
@@ -85,10 +96,10 @@ describe("Objects actions", () => {
     const expectedActions = [
       {
         type: "objects/SET_SORT_BY",
-        sortBy: "name"
+        sortBy: SORT_BY_NAME
       }
     ]
-    store.dispatch(actionsObjects.setSortBy("name"))
+    store.dispatch(actionsObjects.setSortBy(SORT_BY_NAME))
     const actions = store.getActions()
     expect(actions).toEqual(expectedActions)
   })
@@ -98,10 +109,10 @@ describe("Objects actions", () => {
     const expectedActions = [
       {
         type: "objects/SET_SORT_ORDER",
-        sortOrder: true
+        sortOrder: SORT_ORDER_ASC
       }
     ]
-    store.dispatch(actionsObjects.setSortOrder(true))
+    store.dispatch(actionsObjects.setSortOrder(SORT_ORDER_ASC))
     const actions = store.getActions()
     expect(actions).toEqual(expectedActions)
   })
@@ -113,23 +124,26 @@ describe("Objects actions", () => {
     })
     const expectedActions = [
       {
-        type: "objects/SET_LIST",
-        objects: [{ name: "test1" }, { name: "test2" }],
-        marker: "test2",
-        isTruncated: false
+        type: "objects/RESET_LIST"
       },
+      { listLoading: true, type: "objects/SET_LIST_LOADING" },
       {
         type: "objects/SET_SORT_BY",
-        sortBy: ""
+        sortBy: SORT_BY_LAST_MODIFIED
       },
       {
         type: "objects/SET_SORT_ORDER",
-        sortOrder: false
+        sortOrder: SORT_ORDER_DESC
+      },
+      {
+        type: "objects/SET_LIST",
+        objects: [{ name: "test2" }, { name: "test1" }]
       },
       {
         type: "objects/SET_PREFIX_WRITABLE",
         prefixWritable: false
-      }
+      },
+      { listLoading: false, type: "objects/SET_LIST_LOADING" }
     ]
     return store.dispatch(actionsObjects.fetchObjects()).then(() => {
       const actions = store.getActions()
@@ -137,26 +151,43 @@ describe("Objects actions", () => {
     })
   })
 
-  it("creates objects/APPEND_LIST after fetching more objects", () => {
+  it("creates objects/RESET_LIST after failing to fetch the objects from bucket with ListObjects denied for LoggedIn users", () => {
     const store = mockStore({
-      buckets: { currentBucket: "bk1" },
+      buckets: { currentBucket: "test-deny" },
       objects: { currentPrefix: "" }
     })
     const expectedActions = [
       {
-        type: "objects/APPEND_LIST",
-        objects: [{ name: "test1" }, { name: "test2" }],
-        marker: "test2",
-        isTruncated: false
+        type: "objects/RESET_LIST"
+      },
+      { listLoading: true, type: "objects/SET_LIST_LOADING" },
+      {
+        type: "alert/SET",
+        alert: {
+          type: "danger",
+          message: "listobjects is denied",
+          id: alertActions.alertId,
+          autoClear: true
+        }
       },
       {
-        type: "objects/SET_PREFIX_WRITABLE",
-        prefixWritable: false
-      }
+        type: "objects/RESET_LIST"
+      },
+      { listLoading: false, type: "objects/SET_LIST_LOADING" }
     ]
-    return store.dispatch(actionsObjects.fetchObjects(true)).then(() => {
+    return store.dispatch(actionsObjects.fetchObjects()).then(() => {
       const actions = store.getActions()
       expect(actions).toEqual(expectedActions)
+    })
+  })
+
+  it("redirect to login after failing to fetch the objects from bucket for non-LoggedIn users", () => {
+    const store = mockStore({
+      buckets: { currentBucket: "test-deny" },
+      objects: { currentPrefix: "" }
+    })
+    return store.dispatch(actionsObjects.fetchObjects()).then(() => {
+      expect(history.location.pathname.endsWith("/login")).toBeTruthy()
     })
   })
 
@@ -165,28 +196,24 @@ describe("Objects actions", () => {
       objects: {
         list: [],
         sortBy: "",
-        sortOrder: false,
-        isTruncated: false,
-        marker: ""
+        sortOrder: SORT_ORDER_ASC
       }
     })
     const expectedActions = [
       {
         type: "objects/SET_SORT_BY",
-        sortBy: "name"
+        sortBy: SORT_BY_NAME
       },
       {
         type: "objects/SET_SORT_ORDER",
-        sortOrder: true
+        sortOrder: SORT_ORDER_ASC
       },
       {
         type: "objects/SET_LIST",
-        objects: [],
-        isTruncated: false,
-        marker: ""
+        objects: []
       }
     ]
-    store.dispatch(actionsObjects.sortObjects("name"))
+    store.dispatch(actionsObjects.sortObjects(SORT_BY_NAME))
     const actions = store.getActions()
     expect(actions).toEqual(expectedActions)
   })
@@ -198,6 +225,10 @@ describe("Objects actions", () => {
     })
     const expectedActions = [
       { type: "objects/SET_CURRENT_PREFIX", prefix: "abc/" },
+      {
+        type: "objects/RESET_LIST"
+      },
+      { listLoading: true, type: "objects/SET_LIST_LOADING" },
       { type: "objects/CHECKED_LIST_RESET" }
     ]
     store.dispatch(actionsObjects.selectPrefix("abc/"))
@@ -244,7 +275,11 @@ describe("Objects actions", () => {
     const expectedActions = [
       {
         type: "alert/SET",
-        alert: { type: "danger", message: "Invalid bucket", id: 0 }
+        alert: {
+          type: "danger",
+          message: "Invalid bucket",
+          id: alertActions.alertId
+        }
       }
     ]
     return store.dispatch(actionsObjects.deleteObject("obj1")).then(() => {
@@ -355,7 +390,7 @@ describe("Objects actions", () => {
       store.dispatch(actionsObjects.downloadObject("obj1"))
       const url = `${
         window.location.origin
-      }${minioBrowserPrefix}/download/bk1/${encodeURI("pre1/obj1")}?token=''`
+      }${minioBrowserPrefix}/download/bk1/${encodeURI("pre1/obj1")}?token=`
       expect(setLocation).toHaveBeenCalledWith(url)
     })
 
